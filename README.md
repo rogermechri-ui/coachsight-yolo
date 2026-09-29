@@ -1,3 +1,2 @@
-# CoachSight AI - YOLO tracking (RunPod Serverless)
-Deploy on RunPod: Serverless > New Endpoint > Deploy from a GitHub repository.
-GPU: 16 GB (smallest), Active workers: 0, Max workers: 1.
+CoachSight AI - YOLO tracking + lecture des numeros de maillot (RunPod Serverless).
+Variables optionnelles : YOLO_MODEL, SAMPLE_FPS, READ_NUMBERS (1/0), OCR_EVERY_N.
