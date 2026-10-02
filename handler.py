@@ -38,12 +38,21 @@ SEQUENTIAL_READ = os.environ.get("SEQUENTIAL_READ", "1") != "0"
 
 
 def shirt_color(frame, box):
+    """Couleur du maillot : centre du torse, en ignorant la pelouse (verte)
+    qui entoure les petits joueurs sur une video panoramique."""
     x1, y1, x2, y2 = [int(v) for v in box]
-    h = y2 - y1
-    crop = frame[max(y1 + int(h * 0.15), 0):y1 + int(h * 0.5), max(x1, 0):x2]
+    h, w = y2 - y1, x2 - x1
+    cx1, cx2 = x1 + int(w * 0.25), x2 - int(w * 0.25)
+    crop = frame[max(y1 + int(h * 0.18), 0):y1 + int(h * 0.48), max(cx1, 0):max(cx2, cx1 + 1)]
     if crop.size == 0:
         return None
-    return cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).mean(axis=0)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    grass = (hsv[:, 0] >= 30) & (hsv[:, 0] <= 90) & (hsv[:, 1] > 50) & (hsv[:, 2] > 30)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    keep = lab[~grass]
+    if len(keep) < max(4, 0.15 * len(lab)):
+        return None   # presque tout est de la pelouse : mesure non fiable
+    return np.median(keep, axis=0)
 
 
 def read_number(frame, box):
