@@ -32,6 +32,9 @@ OCR_EVERY_N = int(os.environ.get("OCR_EVERY_N", "5"))
 FRAMES_EVERY_S = float(os.environ.get("FRAMES_EVERY_S", "12"))
 FRAMES_WIDTH = int(os.environ.get("FRAMES_WIDTH", "960"))
 FRAMES_QUALITY = int(os.environ.get("FRAMES_QUALITY", "70"))
+# Lecture continue de la video pendant le tracking (plus rapide que de
+# "sauter" a chaque image). Mettre SEQUENTIAL_READ=0 pour revenir a l'ancien mode.
+SEQUENTIAL_READ = os.environ.get("SEQUENTIAL_READ", "1") != "0"
 
 
 def shirt_color(frame, box):
@@ -121,6 +124,45 @@ class FrameCollector:
         return info
 
 
+def iter_frames(cap, start, end, fps_out):
+    """Donne (t, image) toutes les 1/fps_out secondes entre start et end.
+    Mode continu : on se place une seule fois au debut puis on lit la video
+    dans l'ordre (grab sans decodage complet des images ignorees)."""
+    step = 1.0 / fps_out
+    vfps = cap.get(cv2.CAP_PROP_FPS) or 0
+    if not SEQUENTIAL_READ or not (1 <= vfps <= 240):
+        t = start
+        while t <= end:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                return
+            yield t, frame
+            t += step
+        return
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    next_t = start
+    t0 = None
+    n = 0
+    while True:
+        if not cap.grab():
+            return
+        pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if t0 is None:
+            t0 = pos if pos > 0 else start
+        t = pos if pos > 0 else t0 + n / vfps
+        n += 1
+        if t > end + 1e-6:
+            return
+        if t + 0.5 / vfps < next_t:
+            continue
+        ok, frame = cap.retrieve()
+        if not ok:
+            return
+        yield next_t, frame
+        next_t += step
+
+
 def collect_frames(cap, inp, start, end):
     """Passe rapide : une image toutes les `frames_every_s` secondes, puis envoi."""
     collector = FrameCollector(inp)
@@ -153,12 +195,9 @@ def process(inp):
     # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
     # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
     frames_zip = collect_frames(cap, inp, start, end)
-    t = start
-    while t <= end:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ok, frame = cap.read()
-        if not ok:
-            break
+    if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
+        notify(inp, status="frames_ready", frames_zip=frames_zip)
+    for t, frame in iter_frames(cap, start, end, fps_out):
         h, w = frame.shape[:2]
         res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
         pts = []
@@ -177,7 +216,6 @@ def process(inp):
                 pts.append((tid_i, cx / w * PITCH_L, cy / h * PITCH_W, ball, col))
         raw.append((round(t, 2), pts))
         frame_i += 1
-        t += 1.0 / fps_out
     cap.release(); os.remove(tmp)
 
     cols = np.array([p[4] for _, pts in raw for p in pts if p[4] is not None], dtype=np.float32)
@@ -218,6 +256,16 @@ def process(inp):
     return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames,
             "frames_zip": frames_zip, "team_colors": team_colors,
             "ball_frames": ball_frames, "total_frames": len(frames)}
+
+
+def notify(inp, **fields):
+    """Message intermediaire vers l'application (n'interrompt jamais le travail)."""
+    try:
+        body = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
+        body.update(fields)
+        requests.post(inp["callback_url"], json=body, timeout=60)
+    except Exception:
+        pass
 
 
 def handler(job):
