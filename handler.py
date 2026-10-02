@@ -2,8 +2,11 @@
 Recoit la video d'un match, detecte joueurs et ballon, lit les numeros de
 maillot quand ils sont visibles et renvoie le tout a l'application
 (callback_url)."""
+import io
+import json
 import os
 import tempfile
+import zipfile
 from collections import Counter
 
 import cv2
@@ -24,6 +27,11 @@ READ_NUMBERS = os.environ.get("READ_NUMBERS", "1") != "0"
 # Lire les numeros une image sur N : suffisant pour un vote majoritaire
 # fiable par piste, sans exploser la duree du traitement.
 OCR_EVERY_N = int(os.environ.get("OCR_EVERY_N", "5"))
+# Images envoyees a l'application pour construire stats et rapport cote
+# serveur (le navigateur du coach n'a plus a relire la video).
+FRAMES_EVERY_S = float(os.environ.get("FRAMES_EVERY_S", "12"))
+FRAMES_WIDTH = int(os.environ.get("FRAMES_WIDTH", "960"))
+FRAMES_QUALITY = int(os.environ.get("FRAMES_QUALITY", "70"))
 
 
 def shirt_color(frame, box):
@@ -62,6 +70,57 @@ def read_number(frame, box):
     return None
 
 
+class FrameCollector:
+    """Garde une petite image JPEG toutes les `every_s` secondes, puis les
+    envoie en un seul zip (avec un index manifest.json) vers une URL signee."""
+
+    def __init__(self, inp):
+        self.url = inp.get("frames_upload_url")
+        self.every = float(inp.get("frames_every_s", FRAMES_EVERY_S))
+        self.width = int(inp.get("frames_width", FRAMES_WIDTH))
+        self.quality = int(inp.get("frames_quality", FRAMES_QUALITY))
+        self.buf = io.BytesIO()
+        self.zip = zipfile.ZipFile(self.buf, "w", zipfile.ZIP_STORED)
+        self.index = []
+        self.last_t = None
+
+    @property
+    def enabled(self):
+        return bool(self.url) and self.every > 0
+
+    def maybe_add(self, t, frame):
+        if not self.enabled or (self.last_t is not None and t - self.last_t < self.every - 1e-6):
+            return
+        self.last_t = t
+        h, w = frame.shape[:2]
+        if w > self.width:
+            frame = cv2.resize(frame, (self.width, int(h * self.width / w)), interpolation=cv2.INTER_AREA)
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+        if not ok:
+            return
+        name = "frame_%09d.jpg" % int(round(t * 1000))
+        self.zip.writestr(name, jpg.tobytes())
+        self.index.append({"t": round(t, 2), "file": name})
+
+    def upload(self):
+        """Envoie le zip. Une erreur ici ne fait jamais echouer le tracking."""
+        if not self.enabled:
+            return {"uploaded": False, "count": 0, "reason": "no frames_upload_url"}
+        info = {"uploaded": False, "count": len(self.index), "every_s": self.every, "width": self.width}
+        try:
+            self.zip.writestr("manifest.json", json.dumps({"frames": self.index}))
+            self.zip.close()
+            data = self.buf.getvalue()
+            info["bytes"] = len(data)
+            r = requests.put(self.url, data=data, timeout=600,
+                             headers={"Content-Type": "application/zip", "x-upsert": "true"})
+            r.raise_for_status()
+            info["uploaded"] = True
+        except Exception as e:
+            info["error"] = str(e)[:300]
+        return info
+
+
 def process(inp):
     url, start, end = inp["video_url"], float(inp.get("start_s", 0)), float(inp["end_s"])
     fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
@@ -75,12 +134,14 @@ def process(inp):
     raw = []      # (t, [(trackId, x, y, ball, color)])
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
+    collector = FrameCollector(inp)
     t = start
     while t <= end:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
         if not ok:
             break
+        collector.maybe_add(t, frame)
         h, w = frame.shape[:2]
         res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
         pts = []
@@ -101,6 +162,7 @@ def process(inp):
         frame_i += 1
         t += 1.0 / fps_out
     cap.release(); os.remove(tmp)
+    frames_zip = collector.upload()
 
     cols = np.array([p[4] for _, pts in raw for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
@@ -128,7 +190,8 @@ def process(inp):
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
         frames.append({"t": tt, "points": out})
-    return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames}
+    return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames,
+            "frames_zip": frames_zip}
 
 
 def handler(job):
