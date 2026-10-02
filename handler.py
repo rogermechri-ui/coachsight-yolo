@@ -206,8 +206,18 @@ def process(inp):
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
         frames.append({"t": tt, "points": out})
+    # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
+    # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
+    team_colors = []
+    if centers is not None:
+        for i, lab in enumerate(centers):
+            px = np.uint8([[np.clip(lab, 0, 255)]])
+            b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
+            team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
+    ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
     return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames,
-            "frames_zip": frames_zip}
+            "frames_zip": frames_zip, "team_colors": team_colors,
+            "ball_frames": ball_frames, "total_frames": len(frames)}
 
 
 def handler(job):
