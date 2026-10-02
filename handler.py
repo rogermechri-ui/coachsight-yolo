@@ -121,6 +121,22 @@ class FrameCollector:
         return info
 
 
+def collect_frames(cap, inp, start, end):
+    """Passe rapide : une image toutes les `frames_every_s` secondes, puis envoi."""
+    collector = FrameCollector(inp)
+    if not collector.enabled:
+        return collector.upload()
+    t = start
+    while t <= end:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        collector.maybe_add(t, frame)
+        t += collector.every
+    return collector.upload()
+
+
 def process(inp):
     url, start, end = inp["video_url"], float(inp.get("start_s", 0)), float(inp["end_s"])
     fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
@@ -134,14 +150,15 @@ def process(inp):
     raw = []      # (t, [(trackId, x, y, ball, color)])
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
-    collector = FrameCollector(inp)
+    # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
+    # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
+    frames_zip = collect_frames(cap, inp, start, end)
     t = start
     while t <= end:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
         if not ok:
             break
-        collector.maybe_add(t, frame)
         h, w = frame.shape[:2]
         res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
         pts = []
@@ -162,7 +179,6 @@ def process(inp):
         frame_i += 1
         t += 1.0 / fps_out
     cap.release(); os.remove(tmp)
-    frames_zip = collector.upload()
 
     cols = np.array([p[4] for _, pts in raw for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
