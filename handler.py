@@ -9,6 +9,7 @@ import tempfile
 import time
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -33,6 +34,8 @@ OCR_EVERY_N = int(os.environ.get("OCR_EVERY_N", "5"))
 FRAMES_EVERY_S = float(os.environ.get("FRAMES_EVERY_S", "12"))
 FRAMES_WIDTH = int(os.environ.get("FRAMES_WIDTH", "960"))
 FRAMES_QUALITY = int(os.environ.get("FRAMES_QUALITY", "70"))
+# Nombre de lectures video en parallele pour extraire ces images.
+FRAMES_WORKERS = int(os.environ.get("FRAMES_WORKERS", str(min(6, os.cpu_count() or 1))))
 # Lecture continue de la video pendant le tracking (plus rapide que de
 # "sauter" a chaque image). Mettre SEQUENTIAL_READ=0 pour revenir a l'ancien mode.
 SEQUENTIAL_READ = os.environ.get("SEQUENTIAL_READ", "1") != "0"
@@ -121,8 +124,12 @@ class FrameCollector:
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
         if not ok:
             return
+        self.add_jpeg(t, jpg.tobytes())
+
+    def add_jpeg(self, t, data):
+        self.last_t = t
         name = "frame_%09d.jpg" % int(round(t * 1000))
-        self.zip.writestr(name, jpg.tobytes())
+        self.zip.writestr(name, data)
         self.index.append({"t": round(t, 2), "file": name})
 
     def upload(self):
@@ -183,10 +190,51 @@ def iter_frames(cap, start, end, fps_out):
         next_t += step
 
 
-def collect_frames(cap, inp, start, end):
-    """Passe rapide : une image toutes les `frames_every_s` secondes, puis envoi."""
+def _grab_jpegs(source, times, width, quality):
+    """Lit les images aux instants `times` (fichier local) et les compresse en
+    JPEG. Chaque appel a sa propre lecture video : plusieurs appels peuvent
+    tourner en parallele (OpenCV libere le verrou Python pendant le decodage)."""
+    cap = cv2.VideoCapture(source)
+    out = []
+    try:
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                break
+            h, w = frame.shape[:2]
+            if w > width:
+                frame = cv2.resize(frame, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if ok:
+                out.append((t, jpg.tobytes()))
+    finally:
+        cap.release()
+    return out
+
+
+def collect_frames(cap, inp, start, end, source=None):
+    """Passe rapide : une image toutes les `frames_every_s` secondes, puis envoi.
+    Avec un fichier local (`source`), la lecture est repartie sur plusieurs
+    fils en parallele (FRAMES_WORKERS), ce qui divise le temps d'extraction."""
     collector = FrameCollector(inp)
     if not collector.enabled:
+        return collector.upload()
+    if source and FRAMES_WORKERS > 1:
+        times, t = [], start
+        while t <= end:
+            times.append(t)
+            t += collector.every
+        n = min(FRAMES_WORKERS, max(1, len(times)))
+        size = -(-len(times) // n)   # parts contigues, une par fil
+        parts = [times[i:i + size] for i in range(0, len(times), size)]
+        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+            results = list(pool.map(lambda p: _grab_jpegs(source, p, collector.width, collector.quality), parts))
+        for part, res in zip(parts, results):
+            for t, jpg in res:
+                collector.add_jpeg(t, jpg)
+            if len(res) < len(part):
+                break   # fin de video atteinte dans cette partie : on s'arrete la
         return collector.upload()
     t = start
     while t <= end:
@@ -299,7 +347,7 @@ def process(inp):
     # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
     # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
     clock = time.time()
-    frames_zip = collect_frames(cap, inp, start, end)
+    frames_zip = collect_frames(cap, inp, start, end, source=tmp)
     timings["frames_s"] = round(time.time() - clock, 1)
     if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
         notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
