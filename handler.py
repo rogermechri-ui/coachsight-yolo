@@ -24,7 +24,7 @@ except Exception:  # OCR indisponible : le suivi continue sans numeros
 MODEL = YOLO(os.environ.get("YOLO_MODEL", "yolov8m.pt"))
 PITCH_L, PITCH_W = 105.0, 68.0
 SAMPLE_FPS = float(os.environ.get("SAMPLE_FPS", "2"))
-READ_NUMBERS = os.environ.get("READ_NUMBERS", "1") != "0"
+READ_NUMBERS = os.environ.get("READ_NUMBERS", "0") != "0"
 # Lire les numeros une image sur N : suffisant pour un vote majoritaire
 # fiable par piste, sans exploser la duree du traitement.
 OCR_EVERY_N = int(os.environ.get("OCR_EVERY_N", "5"))
@@ -38,7 +38,7 @@ FRAMES_QUALITY = int(os.environ.get("FRAMES_QUALITY", "70"))
 SEQUENTIAL_READ = os.environ.get("SEQUENTIAL_READ", "1") != "0"
 # Lire la video directement depuis son lien (seul le segment demande est
 # telecharge) au lieu de copier tout le fichier. STREAM_VIDEO=0 = ancien mode.
-STREAM_VIDEO = os.environ.get("STREAM_VIDEO", "1") != "0"
+STREAM_VIDEO = os.environ.get("STREAM_VIDEO", "0") != "0"
 # Reconnexion automatique si le flux video est coupe en cours de lecture.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
                       "reconnect;1|reconnect_streamed;1|reconnect_on_network_error;1|reconnect_delay_max;10")
@@ -213,7 +213,7 @@ def open_video(url, start):
     """Ouvre la video en lecture directe depuis son lien si possible (seul le
     segment utile transite), sinon la telecharge entierement (ancien mode).
     Renvoie (cap, fichier_temporaire_ou_None, mode, raison_si_echec)."""
-    why = "stream disabled"
+    why = None   # lecture directe desactivee : rien a signaler
     if STREAM_VIDEO:
         clock = time.time()
         try:
