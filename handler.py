@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import zipfile
 from collections import Counter
 
@@ -35,6 +36,16 @@ FRAMES_QUALITY = int(os.environ.get("FRAMES_QUALITY", "70"))
 # Lecture continue de la video pendant le tracking (plus rapide que de
 # "sauter" a chaque image). Mettre SEQUENTIAL_READ=0 pour revenir a l'ancien mode.
 SEQUENTIAL_READ = os.environ.get("SEQUENTIAL_READ", "1") != "0"
+# Lire la video directement depuis son lien (seul le segment demande est
+# telecharge) au lieu de copier tout le fichier. STREAM_VIDEO=0 = ancien mode.
+STREAM_VIDEO = os.environ.get("STREAM_VIDEO", "1") != "0"
+# Reconnexion automatique si le flux video est coupe en cours de lecture.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                      "reconnect;1|reconnect_streamed;1|reconnect_on_network_error;1|reconnect_delay_max;10")
+# Hauteur minimale (pixels) d'un joueur pour tenter de lire son numero.
+# En dessous (cas des videos panoramiques), les chiffres sont illisibles et
+# la lecture ne fait que ralentir l'analyse.
+OCR_MIN_HEIGHT = int(os.environ.get("OCR_MIN_HEIGHT", "90"))
 
 
 def shirt_color(frame, box):
@@ -62,7 +73,7 @@ def read_number(frame, box):
     x1, y1, x2, y2 = [int(v) for v in box]
     h, w = y2 - y1, x2 - x1
     # Trop petit pour etre lisible : on ne tente pas.
-    if h < 30 or w < 24:
+    if h < OCR_MIN_HEIGHT or w < 24:
         return None
     crop = frame[y1 + int(h * 0.10):y1 + int(h * 0.55), max(x1, 0):x2]
     if crop.size == 0:
@@ -188,44 +199,115 @@ def collect_frames(cap, inp, start, end):
     return collector.upload()
 
 
-def process(inp):
-    url, start, end = inp["video_url"], float(inp.get("start_s", 0)), float(inp["end_s"])
-    fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
+def download(url):
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     with requests.get(url, stream=True, timeout=600) as r:
         r.raise_for_status()
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
-    cap = cv2.VideoCapture(tmp)
+    return tmp
+
+
+def open_video(url, start):
+    """Ouvre la video en lecture directe depuis son lien si possible (seul le
+    segment utile transite), sinon la telecharge entierement (ancien mode).
+    Renvoie (cap, fichier_temporaire_ou_None, mode)."""
+    if STREAM_VIDEO:
+        try:
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+                ok, _ = cap.read()
+                if ok:
+                    return cap, None, "stream"
+            cap.release()
+        except Exception:
+            pass
+    tmp = download(url)
+    return cv2.VideoCapture(tmp), tmp, "download"
+
+
+def video_end(cap):
+    """Duree de la video en secondes (None si inconnue)."""
+    n, vfps = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0, cap.get(cv2.CAP_PROP_FPS) or 0
+    return n / vfps if n > 0 and vfps > 0 else None
+
+
+def track(cap, start, end, fps_out, timings):
+    """Detection + suivi des joueurs et du ballon sur le segment."""
     raw = []      # (t, [(trackId, x, y, ball, color)])
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
-    # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
-    # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
-    frames_zip = collect_frames(cap, inp, start, end)
-    if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
-        notify(inp, status="frames_ready", frames_zip=frames_zip)
+    t_read = t_detect = t_color = t_ocr = 0.0
+    MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
+    clock = time.time()
     for t, frame in iter_frames(cap, start, end, fps_out):
+        t_read += time.time() - clock
         h, w = frame.shape[:2]
+        c = time.time()
         res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
+        t_detect += time.time() - c
         pts = []
         if res.boxes is not None:
             ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
             for box, cls, tid in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), ids):
                 ball = int(cls) == 32
                 cx, cy = (box[0] + box[2]) / 2, box[3] if not ball else (box[1] + box[3]) / 2
+                c = time.time()
                 col = None if ball else shirt_color(frame, box)
+                t_color += time.time() - c
                 tid_i = int(tid) if tid is not None else -1
                 if (not ball and READ_NUMBERS and pytesseract is not None
                         and tid_i >= 0 and frame_i % OCR_EVERY_N == 0):
+                    c = time.time()
                     n = read_number(frame, box)
+                    t_ocr += time.time() - c
                     if n is not None:
                         votes.setdefault(tid_i, Counter()).update([n])
                 pts.append((tid_i, cx / w * PITCH_L, cy / h * PITCH_W, ball, col))
         raw.append((round(t, 2), pts))
         frame_i += 1
-    cap.release(); os.remove(tmp)
+        clock = time.time()
+    timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
+                   color_s=round(t_color, 1), ocr_s=round(t_ocr, 1))
+    return raw, votes
+
+
+def process(inp):
+    url, start, end = inp["video_url"], float(inp.get("start_s", 0)), float(inp["end_s"])
+    fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
+    timings = {}
+    clock = job_clock = time.time()
+    cap, tmp, mode = open_video(url, start)
+    timings["open_s"] = round(time.time() - clock, 1)
+    timings["video_mode"] = mode
+    dur = video_end(cap)
+    if dur:
+        end = min(end, dur)
+    # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
+    # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
+    clock = time.time()
+    frames_zip = collect_frames(cap, inp, start, end)
+    timings["frames_s"] = round(time.time() - clock, 1)
+    if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
+        notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
+    clock = time.time()
+    raw, votes = track(cap, start, end, fps_out, timings)
+    expected = int((end - start) * fps_out) + 1
+    # Lecture directe interrompue (coupure reseau) : on recommence a partir
+    # d'une copie complete de la video pour ne rien perdre.
+    if mode == "stream" and len(raw) < 0.95 * expected:
+        timings["stream_fallback"] = "%d/%d images lues" % (len(raw), expected)
+        cap.release()
+        tmp = download(url)
+        cap = cv2.VideoCapture(tmp)
+        timings["video_mode"] = "download"
+        raw, votes = track(cap, start, end, fps_out, timings)
+    timings["tracking_s"] = round(time.time() - clock, 1)
+    cap.release()
+    if tmp:
+        os.remove(tmp)
 
     cols = np.array([p[4] for _, pts in raw for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
@@ -261,10 +343,11 @@ def process(inp):
             px = np.uint8([[np.clip(lab, 0, 255)]])
             b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
             team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
+    timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
     return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames,
             "frames_zip": frames_zip, "team_colors": team_colors,
-            "ball_frames": ball_frames, "total_frames": len(frames)}
+            "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
 
 def notify(inp, **fields):
