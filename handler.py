@@ -212,20 +212,26 @@ def download(url):
 def open_video(url, start):
     """Ouvre la video en lecture directe depuis son lien si possible (seul le
     segment utile transite), sinon la telecharge entierement (ancien mode).
-    Renvoie (cap, fichier_temporaire_ou_None, mode)."""
+    Renvoie (cap, fichier_temporaire_ou_None, mode, raison_si_echec)."""
+    why = "stream disabled"
     if STREAM_VIDEO:
+        clock = time.time()
         try:
             cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
                 ok, _ = cap.read()
                 if ok:
-                    return cap, None, "stream"
+                    return cap, None, "stream", None
+                why = "opened but first read failed"
+            else:
+                why = "could not open link"
             cap.release()
-        except Exception:
-            pass
+        except Exception as e:
+            why = "error: %s" % str(e)[:120]
+        why += " (%.1f s)" % (time.time() - clock)
     tmp = download(url)
-    return cv2.VideoCapture(tmp), tmp, "download"
+    return cv2.VideoCapture(tmp), tmp, "download", why
 
 
 def video_end(cap):
@@ -270,7 +276,8 @@ def track(cap, start, end, fps_out, timings):
         frame_i += 1
         clock = time.time()
     timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
-                   color_s=round(t_color, 1), ocr_s=round(t_ocr, 1))
+                   color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
+                   numbers_read=sum(sum(c.values()) for c in votes.values()))
     return raw, votes
 
 
@@ -279,9 +286,13 @@ def process(inp):
     fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
     timings = {}
     clock = job_clock = time.time()
-    cap, tmp, mode = open_video(url, start)
+    cap, tmp, mode, why = open_video(url, start)
     timings["open_s"] = round(time.time() - clock, 1)
     timings["video_mode"] = mode
+    if why:
+        timings["stream_fallback"] = "direct read not used: " + why
+    h0, w0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    timings["video_size"] = "%dx%d" % (w0, h0)
     dur = video_end(cap)
     if dur:
         end = min(end, dur)
