@@ -126,6 +126,11 @@ class FrameCollector:
             return
         self.add_jpeg(t, jpg.tobytes())
 
+    def add_jpeg_frame(self, t, frame):
+        """Ajoute l'image sans la regle d'espacement (instants deja choisis)."""
+        self.last_t = None
+        self.maybe_add(t, frame)
+
     def add_jpeg(self, t, data):
         self.last_t = t
         name = "frame_%09d.jpg" % int(round(t * 1000))
@@ -213,19 +218,21 @@ def _grab_jpegs(source, times, width, quality):
     return out
 
 
-def collect_frames(cap, inp, start, end, source=None):
-    """Passe rapide : une image toutes les `frames_every_s` secondes, puis envoi.
-    Avec un fichier local (`source`), la lecture est repartie sur plusieurs
-    fils en parallele (FRAMES_WORKERS), ce qui divise le temps d'extraction."""
+def collect_frames(cap, inp, windows, source=None):
+    """Passe rapide : une image toutes les `frames_every_s` secondes dans chaque
+    periode de jeu (`windows`), puis envoi. Avec un fichier local (`source`),
+    la lecture est repartie sur plusieurs fils en parallele (FRAMES_WORKERS)."""
     collector = FrameCollector(inp)
     if not collector.enabled:
         return collector.upload()
-    if source and FRAMES_WORKERS > 1:
-        times, t = [], start
-        while t <= end:
+    times = []
+    for ws, we in windows:
+        t = ws
+        while t <= we:
             times.append(t)
             t += collector.every
-        n = min(FRAMES_WORKERS, max(1, len(times)))
+    if source and FRAMES_WORKERS > 1 and times:
+        n = min(FRAMES_WORKERS, len(times))
         size = -(-len(times) // n)   # parts contigues, une par fil
         parts = [times[i:i + size] for i in range(0, len(times), size)]
         with ThreadPoolExecutor(max_workers=len(parts)) as pool:
@@ -236,14 +243,12 @@ def collect_frames(cap, inp, start, end, source=None):
             if len(res) < len(part):
                 break   # fin de video atteinte dans cette partie : on s'arrete la
         return collector.upload()
-    t = start
-    while t <= end:
+    for t in times:
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ok, frame = cap.read()
         if not ok:
             break
-        collector.maybe_add(t, frame)
-        t += collector.every
+        collector.add_jpeg_frame(t, frame)
     return collector.upload()
 
 
@@ -288,50 +293,141 @@ def video_end(cap):
     return n / vfps if n > 0 and vfps > 0 else None
 
 
-def track(cap, start, end, fps_out, timings):
-    """Detection + suivi des joueurs et du ballon sur le segment."""
-    raw = []      # (t, [(trackId, x, y, ball, color)])
+def track(cap, windows, fps_out, timings):
+    """Detection + suivi des joueurs et du ballon dans chaque periode de jeu.
+    Les positions sont gardees en coordonnees d'image normalisees (0..1) :
+    la conversion en metres se fait ensuite (calage du terrain si fourni)."""
+    raw = []      # (t, [(trackId, u, v, ball, color)])
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
-    clock = time.time()
-    for t, frame in iter_frames(cap, start, end, fps_out):
-        t_read += time.time() - clock
-        h, w = frame.shape[:2]
-        c = time.time()
-        res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
-        t_detect += time.time() - c
-        pts = []
-        if res.boxes is not None:
-            ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
-            for box, cls, tid in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), ids):
-                ball = int(cls) == 32
-                cx, cy = (box[0] + box[2]) / 2, box[3] if not ball else (box[1] + box[3]) / 2
-                c = time.time()
-                col = None if ball else shirt_color(frame, box)
-                t_color += time.time() - c
-                tid_i = int(tid) if tid is not None else -1
-                if (not ball and READ_NUMBERS and pytesseract is not None
-                        and tid_i >= 0 and frame_i % OCR_EVERY_N == 0):
-                    c = time.time()
-                    n = read_number(frame, box)
-                    t_ocr += time.time() - c
-                    if n is not None:
-                        votes.setdefault(tid_i, Counter()).update([n])
-                pts.append((tid_i, cx / w * PITCH_L, cy / h * PITCH_W, ball, col))
-        raw.append((round(t, 2), pts))
-        frame_i += 1
+    for ws, we in windows:
         clock = time.time()
+        for t, frame in iter_frames(cap, ws, we, fps_out):
+            t_read += time.time() - clock
+            h, w = frame.shape[:2]
+            c = time.time()
+            res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
+            t_detect += time.time() - c
+            pts = []
+            if res.boxes is not None:
+                ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
+                for box, cls, tid in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), ids):
+                    ball = int(cls) == 32
+                    cx, cy = (box[0] + box[2]) / 2, box[3] if not ball else (box[1] + box[3]) / 2
+                    c = time.time()
+                    col = None if ball else shirt_color(frame, box)
+                    t_color += time.time() - c
+                    tid_i = int(tid) if tid is not None else -1
+                    if (not ball and READ_NUMBERS and pytesseract is not None
+                            and tid_i >= 0 and frame_i % OCR_EVERY_N == 0):
+                        c = time.time()
+                        n = read_number(frame, box)
+                        t_ocr += time.time() - c
+                        if n is not None:
+                            votes.setdefault(tid_i, Counter()).update([n])
+                    pts.append((tid_i, cx / w, cy / h, ball, col))
+            raw.append((round(t, 2), pts))
+            frame_i += 1
+            clock = time.time()
     timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
                    numbers_read=sum(sum(c.values()) for c in votes.values()))
     return raw, votes
 
 
+def play_windows(inp, start, end):
+    """Periodes de jeu demandees (ex. [[30, 3430], [4430, 5400]]) limitees au
+    segment ; sans periodes, tout le segment. La mi-temps n'est pas analysee."""
+    out = []
+    for w in inp.get("play_windows") or []:
+        try:
+            ws, we = max(float(w[0]), start), min(float(w[1]), end)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if we - ws >= 1:
+            out.append([ws, we])
+    out.sort()
+    return out or [[start, end]]
+
+
+def build_homography(calib):
+    """Calage du terrain : au moins 4 reperes {"image": [u, v] (0..1),
+    "pitch": [x, y] (metres)}. Renvoie (H, erreur moyenne en metres)."""
+    pts = (calib or {}).get("points") or []
+    if len(pts) < 4:
+        return None, None
+    img = np.float32([p["image"] for p in pts])
+    pit = np.float32([p["pitch"] for p in pts])
+    H, _ = cv2.findHomography(img, pit, 0)
+    if H is None:
+        return None, None
+    proj = cv2.perspectiveTransform(img.reshape(-1, 1, 2), H).reshape(-1, 2)
+    return H, float(np.mean(np.linalg.norm(proj - pit, axis=1)))
+
+
+def to_pitch(H, u, v, L, W):
+    if H is None:   # sans calage : approximation lineaire (ancien comportement)
+        return u * L, v * W
+    p = H @ np.array([u, v, 1.0])
+    return p[0] / p[2], p[1] / p[2]
+
+
+def tactical_metrics(frames, windows, L, W, min_players=6):
+    """Indicateurs par periode et par equipe (groupes 0 et 1), a partir des
+    positions en metres (necessite un terrain cale) :
+    hauteur de la ligne defensive, largeur du bloc, longueur du bloc (compacite)
+    et part du jeu dans chaque tiers. Le gardien (joueur le plus proche de son
+    but) est exclu des mesures de bloc."""
+    out = []
+    for ws, we in windows:
+        fr = [f for f in frames if ws <= f["t"] <= we]
+        per_team = {0: [], 1: []}
+        for f in fr:
+            for team in (0, 1):
+                xs = [(p["x"], p["y"]) for p in f["points"] if not p["ball"] and p["team"] == team]
+                if len(xs) >= min_players:
+                    per_team[team].append(xs)
+        if not per_team[0] or not per_team[1]:
+            out.append({"window": [ws, we], "frames_used": 0, "teams": {}})
+            continue
+        # Cote defendu : l'equipe dont le centre moyen est le plus a gauche defend x = 0.
+        mean_x = {t: float(np.mean([np.mean([p[0] for p in xs]) for xs in per_team[t]])) for t in (0, 1)}
+        left = 0 if mean_x[0] <= mean_x[1] else 1
+        teams = {}
+        for team in (0, 1):
+            own_left = team == left
+            lines, widths, lengths, thirds = [], [], [], [0, 0, 0]
+            for xs in per_team[team]:
+                d = sorted(((x if own_left else L - x), y) for x, y in xs)   # distance a son propre but
+                outfield = d[1:]                                               # sans le gardien
+                lines.append(float(np.mean([p[0] for p in outfield[:3]])))
+                ys = [p[1] for p in outfield]
+                widths.append(max(ys) - min(ys))
+                lengths.append(outfield[-1][0] - outfield[0][0])
+                c = float(np.mean([p[0] for p in outfield]))                    # centre du bloc
+                thirds[min(2, max(0, int(c / (L / 3))))] += 1
+            n = len(per_team[team])
+            teams[str(team)] = {
+                "frames": n,
+                "defensive_line_m": round(float(np.median(lines)), 1),
+                "block_width_m": round(float(np.median(widths)), 1),
+                "block_length_m": round(float(np.median(lengths)), 1),
+                "block_in_thirds_pct": {"defensive": round(100 * thirds[0] / n), "middle": round(100 * thirds[1] / n),
+                                         "attacking": round(100 * thirds[2] / n)},
+                "defends": "left" if own_left else "right",
+            }
+        out.append({"window": [ws, we], "frames_used": min(len(per_team[0]), len(per_team[1])), "teams": teams})
+    return out
+
+
 def process(inp):
     url, start, end = inp["video_url"], float(inp.get("start_s", 0)), float(inp["end_s"])
     fps_out = min(float(inp.get("fps", SAMPLE_FPS)), SAMPLE_FPS)
+    pitch = inp.get("pitch") or {}
+    L, W = float(pitch.get("length", PITCH_L)), float(pitch.get("width", PITCH_W))
+    H, calib_err = build_homography(inp.get("pitch_calibration"))
     timings = {}
     clock = job_clock = time.time()
     cap, tmp, mode, why = open_video(url, start)
@@ -344,16 +440,18 @@ def process(inp):
     dur = video_end(cap)
     if dur:
         end = min(end, dur)
+    windows = play_windows(inp, start, end)
+    timings["analyzed_s"] = round(sum(we - ws for ws, we in windows), 1)
     # Images pour stats/rapport : extraites et envoyees AVANT le tracking,
     # pour que le lien d'envoi (valable ~2 h) ne soit jamais expire.
     clock = time.time()
-    frames_zip = collect_frames(cap, inp, start, end, source=tmp)
+    frames_zip = collect_frames(cap, inp, windows, source=tmp)
     timings["frames_s"] = round(time.time() - clock, 1)
     if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
         notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
     clock = time.time()
-    raw, votes = track(cap, start, end, fps_out, timings)
-    expected = int((end - start) * fps_out) + 1
+    raw, votes = track(cap, windows, fps_out, timings)
+    expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
     if mode == "stream" and len(raw) < 0.95 * expected:
@@ -362,13 +460,26 @@ def process(inp):
         tmp = download(url)
         cap = cv2.VideoCapture(tmp)
         timings["video_mode"] = "download"
-        raw, votes = track(cap, start, end, fps_out, timings)
+        raw, votes = track(cap, windows, fps_out, timings)
     timings["tracking_s"] = round(time.time() - clock, 1)
     cap.release()
     if tmp:
         os.remove(tmp)
 
-    cols = np.array([p[4] for _, pts in raw for p in pts if p[4] is not None], dtype=np.float32)
+    # Positions en metres ; avec calage, tout ce qui est hors du terrain
+    # (public, bancs, arbitres de touche) est ecarte.
+    margin = 2.0
+    placed = []
+    for tt, pts in raw:
+        keep = []
+        for tid, u, v, ball, col in pts:
+            x, y = to_pitch(H, u, v, L, W)
+            if H is not None and not (-margin <= x <= L + margin and -margin <= y <= W + margin):
+                continue
+            keep.append((tid, x, y, ball, col))
+        placed.append((tt, keep))
+
+    cols = np.array([p[4] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
     if len(cols) >= 4:
         _, _, centers = cv2.kmeans(cols, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0), 3, cv2.KMEANS_PP_CENTERS)
@@ -377,7 +488,7 @@ def process(inp):
     tracks = []
     seen = {}
     frames = []
-    for tt, pts in raw:
+    for tt, pts in placed:
         out = []
         for tid, x, y, ball, col in pts:
             team = None
@@ -386,7 +497,7 @@ def process(inp):
             num = None if ball else numbers.get(tid)
             out.append({
                 "trackId": tid, "team": team,
-                "x": round(x, 2), "y": round(y, 2),
+                "x": round(float(x), 2), "y": round(float(y), 2),
                 "ball": ball,
                 "number": num,
             })
@@ -402,10 +513,14 @@ def process(inp):
             px = np.uint8([[np.clip(lab, 0, 255)]])
             b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
             team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
+    calibration = {"calibrated": H is not None, "points": len((inp.get("pitch_calibration") or {}).get("points") or []),
+                   "mean_error_m": round(calib_err, 2) if calib_err is not None else None}
+    tactical = tactical_metrics(frames, windows, L, W) if H is not None else []
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
-    return {"simulated": False, "pitch": {"length": PITCH_L, "width": PITCH_W}, "tracks": tracks, "frames": frames,
-            "frames_zip": frames_zip, "team_colors": team_colors,
+    return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
+            "frames_zip": frames_zip, "team_colors": team_colors, "play_windows": windows,
+            "pitch_calibration": calibration, "tactical": tactical,
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
 
