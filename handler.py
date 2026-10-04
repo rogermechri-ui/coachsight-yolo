@@ -10,6 +10,8 @@ import time
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 
 import cv2
 import numpy as np
@@ -18,6 +20,7 @@ import runpod
 from ultralytics import YOLO
 
 import pitch_fit
+import pitch_track
 
 try:
     import pytesseract
@@ -47,6 +50,14 @@ STREAM_VIDEO = os.environ.get("STREAM_VIDEO", "0") != "0"
 # Reconnexion automatique si le flux video est coupe en cours de lecture.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
                       "reconnect;1|reconnect_streamed;1|reconnect_on_network_error;1|reconnect_delay_max;10")
+# Calage du terrain image par image (camera Veo fixe, voir pitch_track.py).
+# Position de la camera par defaut "x,y,z" en metres (sinon envoyee par
+# l'application dans pitch.camera) ; vide = pas de calage automatique.
+PITCH_CAMERA = os.environ.get("PITCH_CAMERA", "").strip()
+# Mouvement de la camera suivi plusieurs fois par seconde (panoramiques rapides).
+MOTION_FPS = float(os.environ.get("MOTION_FPS", "6"))
+# Recalage fin sur les lignes une image analysee sur N (les autres : mouvement seul).
+PITCH_FULL_EVERY = int(os.environ.get("PITCH_FULL_EVERY", "2"))
 # Hauteur minimale (pixels) d'un joueur pour tenter de lire son numero.
 # En dessous (cas des videos panoramiques), les chiffres sont illisibles et
 # la lecture ne fait que ralentir l'analyse.
@@ -295,19 +306,84 @@ def video_end(cap):
     return n / vfps if n > 0 and vfps > 0 else None
 
 
-def track(cap, windows, fps_out, timings):
+class PitchWorker:
+    """Calage du terrain en tache de fond, pendant que le GPU detecte les joueurs.
+    Recoit les images dans l'ordre ; pour chaque image analysee, garde
+    l'homographie terrain -> image (ou None)."""
+
+    def __init__(self, camera, L, W):
+        self.tracker = pitch_track.PitchTracker(camera, L, W)
+        self.q = queue.Queue(maxsize=32)
+        self.H = {}          # indice de l'image analysee -> (H, score)
+        self.size = None     # taille de l'image de travail (w, h)
+        self.error = None
+        self.n_full = 0
+        self.th = threading.Thread(target=self._run, daemon=True)
+        self.th.start()
+
+    def put(self, kind, frame=None, idx=None):
+        # Image reduite tout de suite : file d'attente legere (2 Mo par image).
+        self.q.put((kind, None if frame is None else pitch_track.to_work(frame), idx))
+
+    def _run(self):
+        while True:
+            kind, frame, idx = self.q.get()
+            if kind == "stop":
+                return
+            if self.error:
+                continue
+            try:
+                if kind == "reset":            # nouvelle periode : la camera a pu bouger
+                    self.tracker.p = None
+                    self.tracker.feat = None
+                    continue
+                img = pitch_track.to_work(frame)
+                self.size = (img.shape[1], img.shape[0])
+                tr = self.tracker
+                if kind == "motion":
+                    tr.motion(img)
+                    continue
+                # image analysee : recalage sur les lignes une fois sur N, sinon mouvement seul
+                if self.n_full % PITCH_FULL_EVERY == 0 or tr.p is None:
+                    H, s = tr.full(img)
+                else:
+                    tr.motion(img)
+                    H, s = tr.current(), None
+                self.n_full += 1
+                self.H[idx] = (H, s)
+            except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
+                self.error = "%s: %s" % (type(e).__name__, str(e)[:200])
+
+    def finish(self):
+        self.put("stop")
+        self.th.join()
+        return self.H
+
+
+def track(cap, windows, fps_out, timings, pitch=None):
     """Detection + suivi des joueurs et du ballon dans chaque periode de jeu.
     Les positions sont gardees en coordonnees d'image normalisees (0..1) :
-    la conversion en metres se fait ensuite (calage du terrain si fourni)."""
+    la conversion en metres se fait ensuite (calage du terrain si fourni).
+    pitch : PitchWorker optionnel, alimente avec les images (analysees et
+    intermediaires) pour caler le terrain image par image."""
     raw = []      # (t, [(trackId, u, v, ball, color)])
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
+    k = max(1, int(round(MOTION_FPS / fps_out))) if pitch else 1
     for ws, we in windows:
         clock = time.time()
-        for t, frame in iter_frames(cap, ws, we, fps_out):
+        if pitch:
+            pitch.put("reset")
+        for j, (t, frame) in enumerate(iter_frames(cap, ws, we, fps_out * k)):
             t_read += time.time() - clock
+            if j % k:
+                pitch.put("motion", frame)
+                clock = time.time()
+                continue
+            if pitch:
+                pitch.put("full", frame, len(raw))
             h, w = frame.shape[:2]
             c = time.time()
             res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
@@ -374,6 +450,22 @@ def to_pitch(H, u, v, L, W):
         return u * L, v * W
     p = H @ np.array([u, v, 1.0])
     return p[0] / p[2], p[1] / p[2]
+
+
+def pitch_camera(inp):
+    """Position de la camera (metres) : pitch.camera envoye par l'application
+    ({x, y, z} ou [x, y, z]), sinon PITCH_CAMERA ; None = pas de calage auto."""
+    cam = (inp.get("pitch") or {}).get("camera")
+    try:
+        if isinstance(cam, dict):
+            return np.array([float(cam["x"]), float(cam["y"]), float(cam["z"])])
+        if isinstance(cam, (list, tuple)) and len(cam) == 3:
+            return np.array([float(c) for c in cam])
+        if PITCH_CAMERA:
+            return np.array([float(c) for c in PITCH_CAMERA.split(",")])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
 
 
 def tactical_metrics(frames, windows, L, W, min_players=6):
@@ -451,8 +543,10 @@ def process(inp):
     timings["frames_s"] = round(time.time() - clock, 1)
     if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
         notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
+    camera = pitch_camera(inp)
     clock = time.time()
-    raw, votes = track(cap, windows, fps_out, timings)
+    worker = PitchWorker(camera, L, W) if camera is not None else None
+    raw, votes = track(cap, windows, fps_out, timings, worker)
     expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
@@ -462,8 +556,24 @@ def process(inp):
         tmp = download(url)
         cap = cv2.VideoCapture(tmp)
         timings["video_mode"] = "download"
-        raw, votes = track(cap, windows, fps_out, timings)
+        if worker:
+            worker.finish()
+            worker = PitchWorker(camera, L, W)
+        raw, votes = track(cap, windows, fps_out, timings, worker)
     timings["tracking_s"] = round(time.time() - clock, 1)
+    per_frame_H, pitch_info = {}, None
+    if worker:
+        c = time.time()
+        per_frame_H = worker.finish()
+        timings["pitch_wait_s"] = round(time.time() - c, 1)     # attente du calage apres le suivi
+        st = worker.tracker.stats
+        timings["pitch_s"] = round(st["time_s"], 1)
+        n_cal = sum(1 for H, _ in per_frame_H.values() if H is not None)
+        pitch_info = {"method": "camera_tracking", "camera": [round(float(x), 2) for x in camera],
+                      "frames": len(raw), "frames_calibrated": n_cal,
+                      "frames_calibrated_pct": round(100.0 * n_cal / max(1, len(raw)), 1),
+                      "global_searches": st["global_searches"], "relocks": st["relocks"],
+                      "motion_failed": st["motion_failed"], "error": worker.error}
     cap.release()
     if tmp:
         os.remove(tmp)
@@ -472,14 +582,23 @@ def process(inp):
     # (public, bancs, arbitres de touche) est ecarte.
     margin = 2.0
     placed = []
-    for tt, pts in raw:
+    cal_flags = []
+    for i, (tt, pts) in enumerate(raw):
+        Hf = per_frame_H.get(i, (None, None))[0]
         keep = []
         for tid, u, v, ball, col in pts:
-            x, y = to_pitch(H, u, v, L, W)
-            if H is not None and not (-margin <= x <= L + margin and -margin <= y <= W + margin):
+            if Hf is not None:
+                xy = pitch_track.image_to_pitch(Hf, u, v, *worker.size)
+                if xy is None:
+                    continue
+                x, y = xy
+            else:
+                x, y = to_pitch(H, u, v, L, W)
+            if (Hf is not None or H is not None) and not (-margin <= x <= L + margin and -margin <= y <= W + margin):
                 continue
             keep.append((tid, x, y, ball, col))
         placed.append((tt, keep))
+        cal_flags.append(Hf is not None or H is not None)
 
     cols = np.array([p[4] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
@@ -490,7 +609,7 @@ def process(inp):
     tracks = []
     seen = {}
     frames = []
-    for tt, pts in placed:
+    for (tt, pts), cal in zip(placed, cal_flags):
         out = []
         for tid, x, y, ball, col in pts:
             team = None
@@ -506,7 +625,7 @@ def process(inp):
             if not ball and tid >= 0 and tid not in seen:
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
-        frames.append({"t": tt, "points": out})
+        frames.append({"t": tt, "points": out, "calibrated": bool(cal)})
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
@@ -517,7 +636,11 @@ def process(inp):
             team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
     calibration = {"calibrated": H is not None, "points": len((inp.get("pitch_calibration") or {}).get("points") or []),
                    "mean_error_m": round(calib_err, 2) if calib_err is not None else None}
-    tactical = tactical_metrics(frames, windows, L, W) if H is not None else []
+    if pitch_info:
+        calibration.update(pitch_info)
+        calibration["calibrated"] = calibration["calibrated"] or pitch_info["frames_calibrated"] > 0
+    cal_frames = [f for f in frames if f["calibrated"]]
+    tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,

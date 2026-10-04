@@ -6,5 +6,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8m.pt')"
-COPY handler.py pitch_fit.py ./
+COPY handler.py pitch_fit.py pitch_track.py ./
 CMD ["python", "-u", "handler.py"]
