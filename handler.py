@@ -409,6 +409,72 @@ def process(inp):
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
 
+PROXY_WIDTH = int(os.environ.get("PROXY_WIDTH", "1920"))
+PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
+
+
+def _ffmpeg_encode(src, dst, width, fps, encoder):
+    """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son)."""
+    import subprocess
+    vf = "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
+    if encoder == "h264_nvenc":
+        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28", "-b:v", "0"]
+    else:
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf", vf, "-an",
+           *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("%s: %s" % (encoder, r.stderr.strip()[-300:]))
+
+
+def prepare(inp):
+    """Tache unique apres l'envoi : cree une copie allegee de la video
+    (1920 de large, 15 images/s, sans son) et l'envoie a l'adresse signee
+    `proxy_upload_url`. Toutes les analyses suivantes peuvent utiliser cette
+    copie : telechargement, lecture et extraction bien plus rapides."""
+    timings = {}
+    clock = job_clock = time.time()
+    src = download(inp["video_url"])
+    timings["download_s"] = round(time.time() - clock, 1)
+    cap = cv2.VideoCapture(src)
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = video_end(cap)
+    cap.release()
+    width = int(inp.get("proxy_width", PROXY_WIDTH))
+    fps = int(inp.get("proxy_fps", PROXY_FPS))
+    dst = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    clock = time.time()
+    encoder, errors = None, []
+    for enc in ("h264_nvenc", "libx264"):   # puce video du GPU d'abord, sinon processeur
+        try:
+            _ffmpeg_encode(src, dst, width, fps, enc)
+            encoder = enc
+            break
+        except Exception as e:
+            errors.append(str(e)[:200])
+    timings["encode_s"] = round(time.time() - clock, 1)
+    if encoder is None:
+        os.remove(src)
+        raise RuntimeError("proxy encoding failed: " + " | ".join(errors))
+    cap = cv2.VideoCapture(dst)
+    pw, ph = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    size_in, size_out = os.path.getsize(src), os.path.getsize(dst)
+    os.remove(src)
+    clock = time.time()
+    with open(dst, "rb") as f:
+        r = requests.put(inp["proxy_upload_url"], data=f, timeout=1800,
+                         headers={"Content-Type": "video/mp4", "x-upsert": "true"})
+    r.raise_for_status()
+    timings["upload_s"] = round(time.time() - clock, 1)
+    os.remove(dst)
+    timings["total_s"] = round(time.time() - job_clock, 1)
+    return {"task": "prepare", "encoder": encoder, "original": {"width": w, "height": h, "bytes": size_in},
+            "proxy": {"width": pw, "height": ph, "fps": fps, "bytes": size_out},
+            "duration_s": round(duration, 2) if duration else None, "timings": timings}
+
+
 def notify(inp, **fields):
     """Message intermediaire vers l'application (n'interrompt jamais le travail)."""
     try:
@@ -422,6 +488,16 @@ def notify(inp, **fields):
 def handler(job):
     inp = job["input"]
     cb = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
+    if inp.get("task") == "prepare":
+        # Copie allegee : message de retour distinct ("proxy_ready" / "proxy_failed")
+        # pour ne jamais etre confondu avec la fin d'une analyse.
+        try:
+            result = prepare(inp)
+            cb.update(status="proxy_ready", result=result)
+        except Exception as e:
+            cb.update(status="proxy_failed", error=str(e)[:900])
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
     try:
         result = process(inp)
         cb.update(status="completed", result=result, stats={"frames": len(result["frames"]), "tracks": len(result.get("tracks", []))})
