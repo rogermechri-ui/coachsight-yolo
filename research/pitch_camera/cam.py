@@ -157,8 +157,8 @@ def grid_search2(fr, C, ths, phs, fs, keep=40):
     return cands
 
 def solve2(fr, C, nref=6):
-    ths = np.radians(np.arange(-75, 75.1, 1.0))
-    phs = np.radians(np.arange(0, 20.1, 0.5))
+    ths = np.radians(np.arange(-100, 100.1, 1.0))
+    phs = np.radians(np.arange(-2, 25.1, 0.5))
     fs = np.geomspace(350, 5000, 30)
     cands = grid_search2(fr, C, ths, phs, fs, keep=10)[:60]
     scored = sorted(((sum(cost_bi(fr, homog(C, th, ph, f, fr.cx, fr.cy))), th, ph, f) for _, th, ph, f in cands), key=lambda x: x[0])
@@ -168,3 +168,34 @@ def solve2(fr, C, nref=6):
         if best is None or r[3] < best[3]:
             best = r
     return best
+
+# --- Dessin correct des lignes (points derriere la camera ignores)
+DENSE = [np.asarray(pl, float) for pl in pf.pitch_polylines(L, W)]
+def _densify(pl, step=0.5):
+    out = []
+    for a, b in zip(pl[:-1], pl[1:]):
+        n = max(2, int(np.hypot(*(b - a)) / step))
+        out.append(a + (b - a) * np.linspace(0, 1, n, endpoint=False)[:, None])
+    out.append(pl[-1:])
+    return np.vstack(out)
+DENSE = [_densify(pl) for pl in DENSE]
+
+def draw_lines(img, H, color=(0, 255, 255), thick=2, canvas=None):
+    out = img.copy() if canvas is None else canvas
+    for pl in DENSE:
+        q = np.column_stack([pl, np.ones(len(pl))]) @ H.T
+        good = q[:, 2] > 0.5
+        p = q[:, :2] / np.where(good, q[:, 2], 1)[:, None]
+        for i in range(len(pl) - 1):
+            if good[i] and good[i + 1] and np.all(np.abs(p[i:i + 2]) < 2e4):
+                cv2.line(out, tuple(np.int32(p[i])), tuple(np.int32(p[i + 1])), color, thick)
+    return out
+
+def cost_bi(fr, H, T=15.0):
+    c1, n = cost_batch(fr, H[None], T)
+    canvas = draw_lines(None, H, 255, 1, canvas=np.zeros((fr.h, fr.w), np.uint8))
+    dm = cv2.distanceTransform(255 - canvas, cv2.DIST_L2, 5)
+    if len(fr.wpts) == 0:
+        return float(c1[0]), T
+    wi = fr.wpts.astype(int)
+    return float(c1[0]), float(np.minimum(dm[wi[:, 1], wi[:, 0]], T).mean())

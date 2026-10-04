@@ -9,7 +9,7 @@ cap=cv2.VideoCapture(clip); tiles=[]
 for i in idx:
     cap.set(cv2.CAP_PROP_POS_FRAMES,i); ok,im=cap.read(); p=res[i][0]
     fr_cx,fr_cy=(163+1117)/2,im.shape[0]/2
-    v=pf.draw_overlay(im,homog(C,p[0],p[1],p[2],fr_cx,fr_cy),length=L,width=W)[:,163:1117]
+    v=draw_lines(im,homog(C,p[0],p[1],p[2],fr_cx,fr_cy))[:,163:1117]
     cv2.putText(v,'%d  s=%.2f'%(i,res[i][1]),(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,255),2); tiles.append(v)
 while len(tiles)%2: tiles.append(np.zeros_like(tiles[0]))
 g=np.vstack([np.hstack(tiles[i:i+2]) for i in range(0,len(tiles),2)])

@@ -64,8 +64,9 @@ if __name__ == '__main__':
                     p = fit_params(C, Hp, p, fr.cx, fr.cy)
             # ajustement fin sur les lignes, petite fenetre ; on ne l'accepte que s'il ameliore nettement
             s0 = float(score(fr, homog(C, *p[:2], p[2], fr.cx, fr.cy)[None])[0])
-            q, s1 = step(fr, C, p, dp=(1.0, 0.4, 0.04))
-            if s1 < s0 - 0.02 and s1 < 0.85:
+            dp = (1.0, 0.4, 0.04) if s0 < 0.9 else (4.0, 1.5, 0.15)
+            q, s1 = step(fr, C, p, dp=dp)
+            if s1 < s0 - 0.02 and s1 < 0.95:
                 p, s = q, s1
             else:
                 s = s0
