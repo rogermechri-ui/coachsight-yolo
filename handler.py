@@ -17,6 +17,8 @@ import requests
 import runpod
 from ultralytics import YOLO
 
+import pitch_fit
+
 try:
     import pytesseract
 except Exception:  # OCR indisponible : le suivi continue sans numeros
@@ -595,23 +597,12 @@ def pitch_probe(inp):
             vis = img.copy()
             for c, x, y, conf in good:
                 cv2.circle(vis, (int(x), int(y)), 6, (0, 0, 255), -1)
-            if len(good) >= 4:
-                src_pts = np.float32([[x, y] for _, x, y, _ in good])
-                dst_pts = np.float32([PITCH_KEYPOINTS[c] for c, _, _, _ in good])
-                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 1.5)
-                if H is not None:
-                    inl = mask.ravel().astype(bool)
-                    proj = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
-                    err = np.linalg.norm(proj - dst_pts, axis=1)
-                    item.update(calibrated=True, inliers=int(inl.sum()),
-                                mean_error_m=round(float(err[inl].mean()), 2) if inl.any() else None)
-                    Hinv = np.linalg.inv(H)
-                    for a, b in PITCH_EDGES:
-                        p = cv2.perspectiveTransform(np.float32([[PITCH_KEYPOINTS[a], PITCH_KEYPOINTS[b]]]), Hinv)[0]
-                        if np.all(np.abs(p) < 1e5):
-                            cv2.line(vis, tuple(int(v) for v in p[0]), tuple(int(v) for v in p[1]), (0, 255, 255), 2)
-                else:
-                    item["calibrated"] = False
+            auto = auto_fit(img, good) if len(good) >= 4 else None
+            if auto:
+                H, score = auto
+                item.update(calibrated=bool(score["line_hit"] >= AUTO_FIT_GOOD), line_hit=score["line_hit"],
+                            mean_error_m=None, mean_dist_px=score["mean_dist_px"])
+                vis = pitch_fit.draw_overlay(vis, H)
             else:
                 item["calibrated"] = False
             small = cv2.resize(vis, (960, int(vis.shape[0] * 960 / vis.shape[1])))
@@ -623,8 +614,26 @@ def pitch_probe(inp):
         os.remove(src)
     done = [r for r in results if r.get("calibrated")]
     return {"task": "pitch_probe", "model": model, "frames": len(results), "calibrated_frames": len(done),
-            "median_error_m": round(float(np.median([r["mean_error_m"] for r in done if r.get("mean_error_m") is not None])), 2) if done else None,
+            "median_error_m": None,
+            "median_line_hit": round(float(np.median([r["line_hit"] for r in results if r.get("line_hit") is not None])), 3)
+            if any(r.get("line_hit") is not None for r in results) else None,
             "results": results}
+
+
+AUTO_FIT_GOOD = float(os.environ.get("AUTO_FIT_GOOD", "0.8"))
+
+
+def auto_fit(frame, kps):
+    """Calage automatique d'une image : homographie de depart a partir des
+    reperes (au moins 4 fiables), puis ajustement sur les lignes blanches.
+    Renvoie (H terrain -> image, score) ou None."""
+    H0, inliers = pitch_fit.homography_from_keypoints(kps, PITCH_KEYPOINTS)
+    if H0 is None:
+        return None
+    try:
+        return pitch_fit.fit_best(frame, H0)
+    except Exception:
+        return None
 
 
 def label_batch(inp):
@@ -679,8 +688,25 @@ def label_batch(inp):
             ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             name = "label_%09d.jpg" % int(round(t * 1000))
             zf.writestr(name, jpg.tobytes())
-            items.append({"t": t, "file": name, "width": fw, "height": fh,
-                          "suggestions": suggestions, "suggestion_error": err})
+            item = {"t": t, "file": name, "width": fw, "height": fh,
+                    "suggestions": suggestions, "suggestion_error": err}
+            # Calage automatique : depart grossier (reperes suggeres) puis
+            # ajustement precis sur les lignes blanches de la pelouse.
+            auto = auto_fit(frame, [(s["id"], s["u"] * fw, s["v"] * fh, s["confidence"]) for s in suggestions])
+            if auto:
+                H, score = auto
+                kp = cv2.perspectiveTransform(np.float32([PITCH_KEYPOINTS]), H)[0]
+                item["auto"] = {
+                    "line_hit": score["line_hit"], "mean_dist_px": score["mean_dist_px"],
+                    "good": score["line_hit"] >= AUTO_FIT_GOOD,
+                    "keypoints": [{"id": i, "u": round(float(x) / fw, 4), "v": round(float(y) / fh, 4),
+                                   "visible": bool(0 <= x < fw and 0 <= y < fh)} for i, (x, y) in enumerate(kp)],
+                }
+                prev = pitch_fit.draw_overlay(frame, H)
+                ok, pj = cv2.imencode(".jpg", prev, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                item["auto"]["preview_file"] = name.replace(".jpg", "_fit.jpg")
+                zf.writestr(item["auto"]["preview_file"], pj.tobytes())
+            items.append(item)
     finally:
         cap.release()
         os.remove(src)
@@ -693,6 +719,8 @@ def label_batch(inp):
                      headers={"Content-Type": "application/zip", "x-upsert": "true"})
     r.raise_for_status()
     return {"task": "label_batch", "count": len(items), "bytes": len(data), "phase": round(phase, 3),
+            "auto_fitted": sum(1 for i in items if i.get("auto")),
+            "auto_good": sum(1 for i in items if (i.get("auto") or {}).get("good")),
             "with_suggestions": sum(1 for i in items if i["suggestions"])}
 
 
