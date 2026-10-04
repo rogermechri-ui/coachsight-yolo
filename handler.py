@@ -642,9 +642,13 @@ def label_batch(inp):
     windows = play_windows(inp, 0.0, dur) if dur else [[0.0, 0.0]]
     total = sum(we - ws for ws, we in windows)
     # Instants regulierement espaces sur le temps de jeu (jamais deux images voisines).
+    # Decalage propre a chaque lot : deux lots sur le meme match ne prennent
+    # jamais les memes instants (sinon on etiquetterait deux fois les memes images).
+    import random
+    phase = float(inp["phase"]) if inp.get("phase") is not None else random.random()
     times = []
     for k in range(count):
-        pos = (k + 0.5) * total / count
+        pos = (k + phase) * total / count
         for ws, we in windows:
             if pos <= we - ws:
                 times.append(round(ws + pos, 2))
@@ -688,7 +692,7 @@ def label_batch(inp):
     r = requests.put(inp["frames_upload_url"], data=data, timeout=600,
                      headers={"Content-Type": "application/zip", "x-upsert": "true"})
     r.raise_for_status()
-    return {"task": "label_batch", "count": len(items), "bytes": len(data),
+    return {"task": "label_batch", "count": len(items), "bytes": len(data), "phase": round(phase, 3),
             "with_suggestions": sum(1 for i in items if i["suggestions"])}
 
 
