@@ -627,6 +627,71 @@ def pitch_probe(inp):
             "results": results}
 
 
+def label_batch(inp):
+    """Prepare un lot d'images a corriger a la main (entrainement de notre
+    propre modele de reperes du terrain) : images reparties sur les periodes
+    de jeu, chacune avec les reperes suggeres (si une cle Roboflow est
+    configuree). Tout est depose en un zip (images + manifest.json) a
+    l'adresse signee frames_upload_url."""
+    key = os.environ.get("ROBOFLOW_API_KEY")
+    model = inp.get("model", os.environ.get("PITCH_MODEL", "football-field-detection-f07vi/14"))
+    count = int(inp.get("count", 50))
+    src = download(inp["video_url"])
+    cap = cv2.VideoCapture(src)
+    dur = video_end(cap) or 0
+    windows = play_windows(inp, 0.0, dur) if dur else [[0.0, 0.0]]
+    total = sum(we - ws for ws, we in windows)
+    # Instants regulierement espaces sur le temps de jeu (jamais deux images voisines).
+    times = []
+    for k in range(count):
+        pos = (k + 0.5) * total / count
+        for ws, we in windows:
+            if pos <= we - ws:
+                times.append(round(ws + pos, 2))
+                break
+            pos -= we - ws
+    buf = io.BytesIO()
+    zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
+    items = []
+    try:
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            h, w = frame.shape[:2]
+            if w > 1280:
+                frame = cv2.resize(frame, (1280, int(h * 1280 / w)), interpolation=cv2.INTER_AREA)
+            fh, fw = frame.shape[:2]
+            suggestions, err = [], None
+            if key:
+                try:
+                    for c, x, y, conf in _roboflow_keypoints(frame, model, key):
+                        if 0 <= c < len(PITCH_KEYPOINTS):
+                            suggestions.append({"id": c, "u": round(x / fw, 4), "v": round(y / fh, 4),
+                                                "confidence": round(conf, 3)})
+                except Exception as e:
+                    err = str(e)[:200]
+            ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            name = "label_%09d.jpg" % int(round(t * 1000))
+            zf.writestr(name, jpg.tobytes())
+            items.append({"t": t, "file": name, "width": fw, "height": fh,
+                          "suggestions": suggestions, "suggestion_error": err})
+    finally:
+        cap.release()
+        os.remove(src)
+    template = [{"id": i, "pitch": [x, y]} for i, (x, y) in enumerate(PITCH_KEYPOINTS)]
+    zf.writestr("manifest.json", json.dumps({"pitch_template_m": {"length": _PL, "width": _PW},
+                                             "keypoints": template, "items": items}))
+    zf.close()
+    data = buf.getvalue()
+    r = requests.put(inp["frames_upload_url"], data=data, timeout=600,
+                     headers={"Content-Type": "application/zip", "x-upsert": "true"})
+    r.raise_for_status()
+    return {"task": "label_batch", "count": len(items), "bytes": len(data),
+            "with_suggestions": sum(1 for i in items if i["suggestions"])}
+
+
 PROXY_WIDTH = int(os.environ.get("PROXY_WIDTH", "1920"))
 PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
 # L'image de base contient un ffmpeg minimal (sans encodeur H.264) en tete du
@@ -709,6 +774,13 @@ def notify(inp, **fields):
 def handler(job):
     inp = job["input"]
     cb = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
+    if inp.get("task") == "label_batch":
+        try:
+            cb.update(status="label_batch_ready", result=label_batch(inp))
+        except Exception as e:
+            cb.update(status="label_batch_failed", error=str(e)[:900])
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
     if inp.get("task") == "pitch_probe":
         # Test de detection automatique du terrain : message de retour distinct.
         try:
