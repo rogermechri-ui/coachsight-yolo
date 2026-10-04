@@ -629,6 +629,9 @@ def pitch_probe(inp):
 
 PROXY_WIDTH = int(os.environ.get("PROXY_WIDTH", "1920"))
 PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
+# L'image de base contient un ffmpeg minimal (sans encodeur H.264) en tete du
+# PATH : on utilise celui du systeme, installe par apt, s'il existe.
+FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg")
 
 
 def _ffmpeg_encode(src, dst, width, fps, encoder):
@@ -639,7 +642,7 @@ def _ffmpeg_encode(src, dst, width, fps, encoder):
         codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28", "-b:v", "0"]
     else:
         codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf", vf, "-an",
+    cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", src, "-vf", vf, "-an",
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
