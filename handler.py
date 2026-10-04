@@ -524,6 +524,109 @@ def process(inp):
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
 
+# --- Test de detection automatique du terrain (calage image par image) ------
+# Gabarit de terrain a 32 reperes (en metres, terrain de 120 x 70) utilise par
+# les modeles publics de reperes de terrain : identifiant de classe 0..31.
+_PL, _PW = 120.0, 70.0
+_PBW, _PBL, _GBW, _GBL, _CCR, _PSD = 41.0, 20.15, 18.32, 5.5, 9.15, 11.0
+PITCH_KEYPOINTS = [
+    (0, 0), (0, (_PW - _PBW) / 2), (0, (_PW - _GBW) / 2), (0, (_PW + _GBW) / 2), (0, (_PW + _PBW) / 2), (0, _PW),
+    (_GBL, (_PW - _GBW) / 2), (_GBL, (_PW + _GBW) / 2), (_PSD, _PW / 2),
+    (_PBL, (_PW - _PBW) / 2), (_PBL, (_PW - _GBW) / 2), (_PBL, (_PW + _GBW) / 2), (_PBL, (_PW + _PBW) / 2),
+    (_PL / 2, 0), (_PL / 2, _PW / 2 - _CCR), (_PL / 2, _PW / 2 + _CCR), (_PL / 2, _PW),
+    (_PL - _PBL, (_PW - _PBW) / 2), (_PL - _PBL, (_PW - _GBW) / 2), (_PL - _PBL, (_PW + _GBW) / 2), (_PL - _PBL, (_PW + _PBW) / 2),
+    (_PL - _PSD, _PW / 2), (_PL - _GBL, (_PW - _GBW) / 2), (_PL - _GBL, (_PW + _GBW) / 2),
+    (_PL, 0), (_PL, (_PW - _PBW) / 2), (_PL, (_PW - _GBW) / 2), (_PL, (_PW + _GBW) / 2), (_PL, (_PW + _PBW) / 2), (_PL, _PW),
+    (_PL / 2 - _CCR, _PW / 2), (_PL / 2 + _CCR, _PW / 2),
+]
+# Lignes du terrain (paires de reperes) pour dessiner le controle visuel.
+PITCH_EDGES = [(0, 5), (0, 24), (5, 29), (24, 29), (13, 16), (1, 9), (9, 12), (12, 4), (2, 6), (6, 7), (7, 3),
+               (25, 17), (17, 20), (20, 28), (26, 22), (22, 23), (23, 27)]
+
+
+def _roboflow_keypoints(img, model, key):
+    """Appelle le service en ligne Roboflow sur une image ; renvoie
+    [(classe, x, y, confiance)] en pixels de `img`."""
+    import base64
+    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    r = requests.post("https://detect.roboflow.com/%s" % model, params={"api_key": key},
+                      data=base64.b64encode(jpg.tobytes()),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
+    r.raise_for_status()
+    out = []
+    for det in r.json().get("predictions", []):
+        for kp in det.get("keypoints", []):
+            out.append((int(kp.get("class_id", -1)), float(kp["x"]), float(kp["y"]), float(kp.get("confidence", 0))))
+    return out
+
+
+def pitch_probe(inp):
+    """Sur quelques images du match : detecte les reperes du terrain, calcule le
+    calage de chaque image et renvoie la qualite obtenue + une image de controle
+    (lignes du terrain redessinees a partir du calage)."""
+    import base64
+    key = os.environ.get("ROBOFLOW_API_KEY")
+    if not key:
+        raise RuntimeError("ROBOFLOW_API_KEY is not set on this endpoint")
+    model = inp.get("model", os.environ.get("PITCH_MODEL", "football-field-detection-f07vi/14"))
+    min_conf = float(inp.get("min_confidence", 0.5))
+    src = download(inp["video_url"])
+    cap = cv2.VideoCapture(src)
+    results = []
+    try:
+        for t in inp.get("times") or []:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(t) * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                results.append({"t": t, "error": "frame not readable"})
+                continue
+            h, w = frame.shape[:2]
+            scale = 1280.0 / w if w > 1280 else 1.0
+            img = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale < 1 else frame
+            item = {"t": t}
+            try:
+                kps = _roboflow_keypoints(img, model, key)
+            except Exception as e:
+                item["error"] = "roboflow: %s" % str(e)[:200]
+                results.append(item)
+                continue
+            good = [k for k in kps if k[3] >= min_conf and 0 <= k[0] < len(PITCH_KEYPOINTS)]
+            item.update(keypoints_detected=len(kps), keypoints_confident=len(good))
+            vis = img.copy()
+            for c, x, y, conf in good:
+                cv2.circle(vis, (int(x), int(y)), 6, (0, 0, 255), -1)
+            if len(good) >= 4:
+                src_pts = np.float32([[x, y] for _, x, y, _ in good])
+                dst_pts = np.float32([PITCH_KEYPOINTS[c] for c, _, _, _ in good])
+                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 1.5)
+                if H is not None:
+                    inl = mask.ravel().astype(bool)
+                    proj = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+                    err = np.linalg.norm(proj - dst_pts, axis=1)
+                    item.update(calibrated=True, inliers=int(inl.sum()),
+                                mean_error_m=round(float(err[inl].mean()), 2) if inl.any() else None)
+                    Hinv = np.linalg.inv(H)
+                    for a, b in PITCH_EDGES:
+                        p = cv2.perspectiveTransform(np.float32([[PITCH_KEYPOINTS[a], PITCH_KEYPOINTS[b]]]), Hinv)[0]
+                        if np.all(np.abs(p) < 1e5):
+                            cv2.line(vis, tuple(int(v) for v in p[0]), tuple(int(v) for v in p[1]), (0, 255, 255), 2)
+                else:
+                    item["calibrated"] = False
+            else:
+                item["calibrated"] = False
+            small = cv2.resize(vis, (960, int(vis.shape[0] * 960 / vis.shape[1])))
+            ok, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            item["preview_jpg_base64"] = base64.b64encode(jpg.tobytes()).decode()
+            results.append(item)
+    finally:
+        cap.release()
+        os.remove(src)
+    done = [r for r in results if r.get("calibrated")]
+    return {"task": "pitch_probe", "model": model, "frames": len(results), "calibrated_frames": len(done),
+            "median_error_m": round(float(np.median([r["mean_error_m"] for r in done if r.get("mean_error_m") is not None])), 2) if done else None,
+            "results": results}
+
+
 PROXY_WIDTH = int(os.environ.get("PROXY_WIDTH", "1920"))
 PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
 
@@ -603,6 +706,14 @@ def notify(inp, **fields):
 def handler(job):
     inp = job["input"]
     cb = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
+    if inp.get("task") == "pitch_probe":
+        # Test de detection automatique du terrain : message de retour distinct.
+        try:
+            cb.update(status="probe_ready", result=pitch_probe(inp))
+        except Exception as e:
+            cb.update(status="probe_failed", error=str(e)[:900])
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
     if inp.get("task") == "prepare":
         # Copie allegee : message de retour distinct ("proxy_ready" / "proxy_failed")
         # pour ne jamais etre confondu avec la fin d'une analyse.
