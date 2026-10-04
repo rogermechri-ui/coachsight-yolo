@@ -11,8 +11,11 @@ from scipy.optimize import minimize
 
 # Gabarit en metres (meme convention que PITCH_KEYPOINTS dans handler.py :
 # x le long du terrain depuis le but de gauche, y depuis la touche du haut).
-L, W = 120.0, 70.0
-PBW, PBL, GBW, GBL, CCR, PSD = 41.0, 20.15, 18.32, 5.5, 9.15, 11.0
+# Taille par defaut : 105 x 68 (mesuree sur Frock Field, Catawba) ; les
+# marquages (surfaces, rond central, point de penalty) ont des tailles fixes
+# par le reglement, quelle que soit la taille du terrain.
+L, W = 105.0, 68.0
+PBW, PBL, GBW, GBL, CCR, PSD = 40.32, 16.5, 18.32, 5.5, 9.15, 11.0
 
 
 def pitch_polylines(length=L, width=W):
@@ -57,15 +60,19 @@ def line_mask(img):
     white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     # On ne garde que les traces fines et longues (lignes) : les maillots
     # blancs, le ballon et les reflets forment des taches epaisses qu'on ecarte.
-    # Epaisseur = distance maximale au bord a l'interieur de chaque tache.
-    from scipy import ndimage
+    # On efface les zones epaisses (et leurs abords) pixel par pixel, ce qui
+    # garde le reste d'un reseau de lignes meme si un croisement est epais,
+    # puis on ne garde que les traces assez longues.
+    dt = cv2.distanceTransform(white, cv2.DIST_L2, 3)
+    thick = (dt > 4.5).astype(np.uint8)
+    if thick.any():
+        grow = cv2.dilate(thick, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        white[grow > 0] = 0
     n, lab, stats, _ = cv2.connectedComponentsWithStats(white, 8)
     if n > 1:
-        dt = cv2.distanceTransform(white, cv2.DIST_L2, 3)
-        half = np.asarray(ndimage.maximum(dt, lab, index=np.arange(1, n)))
         span = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT])
         keep = np.zeros(n, bool)
-        keep[1:] = (half <= 4.5) & (span >= 30)
+        keep[1:] = span >= 30
         white = (keep[lab] * 255).astype(np.uint8)
     return white, grass
 
@@ -89,6 +96,7 @@ class LineFitter:
         inv = 255 - self.white
         self.dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
         self.trunc = trunc
+        self.length, self.width = length, width
         self.samples = sample_pitch(0.5, length, width)
 
     def _project(self, Hpi):
@@ -113,8 +121,9 @@ class LineFitter:
         """Hpi : homographie terrain (m) -> image (px). Renvoie (H, score)."""
         # Parametrage par la position image de 4 points de controle du terrain
         # (bien conditionne) ; on part des points visibles les plus ecartes.
-        ctrl = np.float32([[L * 0.25, W * 0.25], [L * 0.75, W * 0.25],
-                           [L * 0.75, W * 0.75], [L * 0.25, W * 0.75]])
+        L_, W_ = self.length, self.width
+        ctrl = np.float32([[L_ * 0.25, W_ * 0.25], [L_ * 0.75, W_ * 0.25],
+                           [L_ * 0.75, W_ * 0.75], [L_ * 0.25, W_ * 0.75]])
         p0 = cv2.perspectiveTransform(ctrl.reshape(-1, 1, 2), Hpi).reshape(-1)
 
         def to_H(p):
@@ -213,8 +222,8 @@ def fit_best(img, Hpi, restarts=12, seed=0, length=L, width=W):
     mieux aux lignes blanches (part du dessin sur une vraie ligne)."""
     rng = np.random.default_rng(seed)
     fitter = LineFitter(img, length, width)
-    ctrl = np.float32([[L * 0.25, W * 0.25], [L * 0.75, W * 0.25],
-                       [L * 0.75, W * 0.75], [L * 0.25, W * 0.75]])
+    ctrl = np.float32([[length * 0.25, width * 0.25], [length * 0.75, width * 0.25],
+                       [length * 0.75, width * 0.75], [length * 0.25, width * 0.75]])
     base = cv2.perspectiveTransform(ctrl.reshape(-1, 1, 2), Hpi).reshape(-1, 2)
     starts = [Hpi]
     try:

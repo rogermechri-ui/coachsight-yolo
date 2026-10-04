@@ -527,20 +527,34 @@ def process(inp):
 
 
 # --- Test de detection automatique du terrain (calage image par image) ------
-# Gabarit de terrain a 32 reperes (en metres, terrain de 120 x 70) utilise par
-# les modeles publics de reperes de terrain : identifiant de classe 0..31.
-_PL, _PW = 120.0, 70.0
-_PBW, _PBL, _GBW, _GBL, _CCR, _PSD = 41.0, 20.15, 18.32, 5.5, 9.15, 11.0
-PITCH_KEYPOINTS = [
-    (0, 0), (0, (_PW - _PBW) / 2), (0, (_PW - _GBW) / 2), (0, (_PW + _GBW) / 2), (0, (_PW + _PBW) / 2), (0, _PW),
-    (_GBL, (_PW - _GBW) / 2), (_GBL, (_PW + _GBW) / 2), (_PSD, _PW / 2),
-    (_PBL, (_PW - _PBW) / 2), (_PBL, (_PW - _GBW) / 2), (_PBL, (_PW + _GBW) / 2), (_PBL, (_PW + _PBW) / 2),
-    (_PL / 2, 0), (_PL / 2, _PW / 2 - _CCR), (_PL / 2, _PW / 2 + _CCR), (_PL / 2, _PW),
-    (_PL - _PBL, (_PW - _PBW) / 2), (_PL - _PBL, (_PW - _GBW) / 2), (_PL - _PBL, (_PW + _GBW) / 2), (_PL - _PBL, (_PW + _PBW) / 2),
-    (_PL - _PSD, _PW / 2), (_PL - _GBL, (_PW - _GBW) / 2), (_PL - _GBL, (_PW + _GBW) / 2),
-    (_PL, 0), (_PL, (_PW - _PBW) / 2), (_PL, (_PW - _GBW) / 2), (_PL, (_PW + _GBW) / 2), (_PL, (_PW + _PBW) / 2), (_PL, _PW),
-    (_PL / 2 - _CCR, _PW / 2), (_PL / 2 + _CCR, _PW / 2),
-]
+# Gabarit de terrain a 32 reperes (identifiants 0..31 des modeles publics de
+# reperes de terrain), construit a la taille reelle du terrain du match :
+# longueur et largeur variables, marquages aux tailles du reglement.
+_PBW, _PBL, _GBW, _GBL, _CCR, _PSD = 40.32, 16.5, 18.32, 5.5, 9.15, 11.0
+
+
+def pitch_keypoints(_PL=PITCH_L, _PW=PITCH_W):
+    return [
+        (0, 0), (0, (_PW - _PBW) / 2), (0, (_PW - _GBW) / 2), (0, (_PW + _GBW) / 2), (0, (_PW + _PBW) / 2), (0, _PW),
+        (_GBL, (_PW - _GBW) / 2), (_GBL, (_PW + _GBW) / 2), (_PSD, _PW / 2),
+        (_PBL, (_PW - _PBW) / 2), (_PBL, (_PW - _GBW) / 2), (_PBL, (_PW + _GBW) / 2), (_PBL, (_PW + _PBW) / 2),
+        (_PL / 2, 0), (_PL / 2, _PW / 2 - _CCR), (_PL / 2, _PW / 2 + _CCR), (_PL / 2, _PW),
+        (_PL - _PBL, (_PW - _PBW) / 2), (_PL - _PBL, (_PW - _GBW) / 2), (_PL - _PBL, (_PW + _GBW) / 2), (_PL - _PBL, (_PW + _PBW) / 2),
+        (_PL - _PSD, _PW / 2), (_PL - _GBL, (_PW - _GBW) / 2), (_PL - _GBL, (_PW + _GBW) / 2),
+        (_PL, 0), (_PL, (_PW - _PBW) / 2), (_PL, (_PW - _GBW) / 2), (_PL, (_PW + _GBW) / 2), (_PL, (_PW + _PBW) / 2), (_PL, _PW),
+        (_PL / 2 - _CCR, _PW / 2), (_PL / 2 + _CCR, _PW / 2),
+    ]
+
+
+PITCH_KEYPOINTS = pitch_keypoints()
+
+
+def pitch_size(inp):
+    """Taille du terrain du match (metres), 105 x 68 par defaut."""
+    pitch = inp.get("pitch") or {}
+    return float(pitch.get("length", PITCH_L)), float(pitch.get("width", PITCH_W))
+
+
 # Lignes du terrain (paires de reperes) pour dessiner le controle visuel.
 PITCH_EDGES = [(0, 5), (0, 24), (5, 29), (24, 29), (13, 16), (1, 9), (9, 12), (12, 4), (2, 6), (6, 7), (7, 3),
                (25, 17), (17, 20), (20, 28), (26, 22), (22, 23), (23, 27)]
@@ -572,6 +586,7 @@ def pitch_probe(inp):
         raise RuntimeError("ROBOFLOW_API_KEY is not set on this endpoint")
     model = inp.get("model", os.environ.get("PITCH_MODEL", "football-field-detection-f07vi/14"))
     min_conf = float(inp.get("min_confidence", 0.5))
+    L, W = pitch_size(inp)
     src = download(inp["video_url"])
     cap = cv2.VideoCapture(src)
     results = []
@@ -597,12 +612,12 @@ def pitch_probe(inp):
             vis = img.copy()
             for c, x, y, conf in good:
                 cv2.circle(vis, (int(x), int(y)), 6, (0, 0, 255), -1)
-            auto = auto_fit(img, good) if len(good) >= 4 else None
+            auto = auto_fit(img, good, L, W) if len(good) >= 4 else None
             if auto:
                 H, score = auto
                 item.update(calibrated=bool(score["line_hit"] >= AUTO_FIT_GOOD), line_hit=score["line_hit"],
                             mean_error_m=None, mean_dist_px=score["mean_dist_px"])
-                vis = pitch_fit.draw_overlay(vis, H)
+                vis = pitch_fit.draw_overlay(vis, H, length=L, width=W)
             else:
                 item["calibrated"] = False
             small = cv2.resize(vis, (960, int(vis.shape[0] * 960 / vis.shape[1])))
@@ -623,15 +638,15 @@ def pitch_probe(inp):
 AUTO_FIT_GOOD = float(os.environ.get("AUTO_FIT_GOOD", "0.8"))
 
 
-def auto_fit(frame, kps):
+def auto_fit(frame, kps, L=PITCH_L, W=PITCH_W):
     """Calage automatique d'une image : homographie de depart a partir des
     reperes (au moins 4 fiables), puis ajustement sur les lignes blanches.
     Renvoie (H terrain -> image, score) ou None."""
-    H0, inliers = pitch_fit.homography_from_keypoints(kps, PITCH_KEYPOINTS)
+    H0, inliers = pitch_fit.homography_from_keypoints(kps, pitch_keypoints(L, W))
     if H0 is None:
         return None
     try:
-        return pitch_fit.fit_best(frame, H0)
+        return pitch_fit.fit_best(frame, H0, length=L, width=W)
     except Exception:
         return None
 
@@ -645,6 +660,8 @@ def label_batch(inp):
     key = os.environ.get("ROBOFLOW_API_KEY")
     model = inp.get("model", os.environ.get("PITCH_MODEL", "football-field-detection-f07vi/14"))
     count = int(inp.get("count", 50))
+    L, W = pitch_size(inp)
+    template_kp = pitch_keypoints(L, W)
     src = download(inp["video_url"])
     cap = cv2.VideoCapture(src)
     dur = video_end(cap) or 0
@@ -692,17 +709,17 @@ def label_batch(inp):
                     "suggestions": suggestions, "suggestion_error": err}
             # Calage automatique : depart grossier (reperes suggeres) puis
             # ajustement precis sur les lignes blanches de la pelouse.
-            auto = auto_fit(frame, [(s["id"], s["u"] * fw, s["v"] * fh, s["confidence"]) for s in suggestions])
+            auto = auto_fit(frame, [(s["id"], s["u"] * fw, s["v"] * fh, s["confidence"]) for s in suggestions], L, W)
             if auto:
                 H, score = auto
-                kp = cv2.perspectiveTransform(np.float32([PITCH_KEYPOINTS]), H)[0]
+                kp = cv2.perspectiveTransform(np.float32([template_kp]), H)[0]
                 item["auto"] = {
                     "line_hit": score["line_hit"], "mean_dist_px": score["mean_dist_px"],
                     "good": score["line_hit"] >= AUTO_FIT_GOOD,
                     "keypoints": [{"id": i, "u": round(float(x) / fw, 4), "v": round(float(y) / fh, 4),
                                    "visible": bool(0 <= x < fw and 0 <= y < fh)} for i, (x, y) in enumerate(kp)],
                 }
-                prev = pitch_fit.draw_overlay(frame, H)
+                prev = pitch_fit.draw_overlay(frame, H, length=L, width=W)
                 ok, pj = cv2.imencode(".jpg", prev, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 item["auto"]["preview_file"] = name.replace(".jpg", "_fit.jpg")
                 zf.writestr(item["auto"]["preview_file"], pj.tobytes())
@@ -710,8 +727,8 @@ def label_batch(inp):
     finally:
         cap.release()
         os.remove(src)
-    template = [{"id": i, "pitch": [x, y]} for i, (x, y) in enumerate(PITCH_KEYPOINTS)]
-    zf.writestr("manifest.json", json.dumps({"pitch_template_m": {"length": _PL, "width": _PW},
+    template = [{"id": i, "pitch": [x, y]} for i, (x, y) in enumerate(template_kp)]
+    zf.writestr("manifest.json", json.dumps({"pitch_template_m": {"length": L, "width": W},
                                              "keypoints": template, "items": items}))
     zf.close()
     data = buf.getvalue()
