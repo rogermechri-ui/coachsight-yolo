@@ -468,6 +468,51 @@ def pitch_camera(inp):
     return None
 
 
+# Memoire des joueurs sortis de l'image (camera Veo qui suit le ballon : on ne
+# voit qu'une partie du terrain a chaque instant).
+MEMORY_S = float(os.environ.get("PLAYER_MEMORY_S", "6"))
+TACTICAL_MIN_PLAYERS = int(os.environ.get("TACTICAL_MIN_PLAYERS", "8"))
+
+
+def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
+    """Pour chaque image calee, ajoute aux joueurs visibles la derniere position
+    connue (moins de memory_s secondes) de ceux qui sont sortis du champ de la
+    camera. Un joueur memorise dont la position tombe dans la partie visible du
+    terrain est oublie : s'il etait encore la, il serait detecte (ou il a change
+    de numero de piste). Renvoie une nouvelle liste d'images (pour les mesures
+    tactiques uniquement)."""
+    out = []
+    mem = {}     # trackId -> (t, x, y, team)
+    w, h = size or (0, 0)
+    for i, f in enumerate(frames):
+        Hf = per_frame_H.get(i, (None, None))[0]
+        if not f.get("calibrated") or Hf is None:
+            out.append(f)
+            continue
+        t = f["t"]
+        seen = set()
+        pts = list(f["points"])
+        for p in pts:
+            if not p["ball"] and p["trackId"] >= 0 and p["team"] is not None:
+                mem[p["trackId"]] = (t, p["x"], p["y"], p["team"])
+                seen.add(p["trackId"])
+        for tid in list(mem):
+            mt, x, y, team = mem[tid]
+            if t - mt > memory_s or t < mt:
+                del mem[tid]
+                continue
+            if tid in seen:
+                continue
+            q = Hf @ np.array([x, y, 1.0])
+            if q[2] > 0 and 0 <= q[0] / q[2] < w and 0 <= q[1] / q[2] < h:
+                del mem[tid]          # devrait etre visible : position perimee
+                continue
+            pts.append({"trackId": tid, "team": team, "x": x, "y": y, "ball": False,
+                        "number": None, "remembered": True})
+        out.append({"t": t, "points": pts, "calibrated": True})
+    return out
+
+
 def tactical_metrics(frames, windows, L, W, min_players=6):
     """Indicateurs par periode et par equipe (groupes 0 et 1), a partir des
     positions en metres (necessite un terrain cale) :
@@ -639,8 +684,17 @@ def process(inp):
     if pitch_info:
         calibration.update(pitch_info)
         calibration["calibrated"] = calibration["calibrated"] or pitch_info["frames_calibrated"] > 0
-    cal_frames = [f for f in frames if f["calibrated"]]
-    tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
+    if pitch_info:
+        # Camera qui suit le jeu : equipes reconstituees avec la memoire des joueurs
+        # hors champ, et mesures seulement quand l'equipe est presque entiere.
+        mframes = [f for f in with_memory(frames, per_frame_H, worker.size) if f["calibrated"]]
+        tactical = tactical_metrics(mframes, windows, L, W, min_players=TACTICAL_MIN_PLAYERS) if mframes else []
+        counts = [sum(1 for p in f["points"] if not p["ball"] and p["team"] == tm) for f in mframes for tm in (0, 1)]
+        if counts:
+            calibration["players_per_team_median"] = float(np.median(counts))
+    else:
+        cal_frames = [f for f in frames if f["calibrated"]]
+        tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
