@@ -58,6 +58,11 @@ PITCH_CAMERA = os.environ.get("PITCH_CAMERA", "").strip()
 MOTION_FPS = float(os.environ.get("MOTION_FPS", "6"))
 # Recalage fin sur les lignes une image analysee sur N (les autres : mouvement seul).
 PITCH_FULL_EVERY = int(os.environ.get("PITCH_FULL_EVERY", "2"))
+# Detection : on retire les bandes noires des videos Veo (image 16:9 dans un
+# cadre 21:9) et on analyse a une taille suffisante pour voir les joueurs
+# lointains (640 = taille par defaut de YOLO : la moitie des joueurs echappent).
+CROP_BARS = os.environ.get("CROP_BARS", "1") != "0"
+YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "960"))
 # Hauteur minimale (pixels) d'un joueur pour tenter de lire son numero.
 # En dessous (cas des videos panoramiques), les chiffres sont illisibles et
 # la lecture ne fait que ralentir l'analyse.
@@ -372,6 +377,7 @@ def track(cap, windows, fps_out, timings, pitch=None):
     t_read = t_detect = t_color = t_ocr = 0.0
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
     k = max(1, int(round(MOTION_FPS / fps_out))) if pitch else 1
+    crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
     for ws, we in windows:
         clock = time.time()
         if pitch:
@@ -386,12 +392,22 @@ def track(cap, windows, fps_out, timings, pitch=None):
                 pitch.put("full", frame, len(raw))
             h, w = frame.shape[:2]
             c = time.time()
-            res = MODEL.track(frame, persist=True, classes=[0, 32], conf=0.25, verbose=False)[0]
+            if crop is None:
+                crop = pitch_fit.content_box(frame) if CROP_BARS else (0, 0, w, h)
+                if crop[2] - crop[0] < w // 2 or crop[3] - crop[1] < h // 2:
+                    crop = None          # image noire (debut de video) : on reessaiera
+            x0, y0, x1, y1 = crop or (0, 0, w, h)
+            # Detection seule (pas le suivi integre de YOLO : a 2 images/s avec une
+            # camera qui bouge, il ne garde que quelques joueurs et jette les autres).
+            # Les identifiants sont attribues ensuite, sur le terrain (assign_ids).
+            res = MODEL.predict(frame[y0:y1, x0:x1], classes=[0, 32], conf=0.25,
+                                imgsz=YOLO_IMGSZ, verbose=False)[0]
             t_detect += time.time() - c
             pts = []
             if res.boxes is not None:
                 ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
                 for box, cls, tid in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), ids):
+                    box = [box[0] + x0, box[1] + y0, box[2] + x0, box[3] + y0]
                     ball = int(cls) == 32
                     cx, cy = (box[0] + box[2]) / 2, box[3] if not ball else (box[1] + box[3]) / 2
                     c = time.time()
@@ -472,6 +488,39 @@ def pitch_camera(inp):
 # voit qu'une partie du terrain a chaque instant).
 MEMORY_S = float(os.environ.get("PLAYER_MEMORY_S", "6"))
 TACTICAL_MIN_PLAYERS = int(os.environ.get("TACTICAL_MIN_PLAYERS", "8"))
+
+
+def assign_ids(placed, gate=4.0, max_gap_s=1.5):
+    """Identifiants de joueurs d'une image a l'autre, par plus proche voisin sur
+    le terrain (metres) : insensible aux mouvements de la camera. placed : liste
+    de (t, [(tid, x, y, ball, col)]) ; renvoie la meme liste avec les tid."""
+    from scipy.optimize import linear_sum_assignment
+    tracks = {}      # id -> (t, x, y)
+    next_id = 0
+    out = []
+    for t, pts in placed:
+        players = [i for i, p in enumerate(pts) if not p[3]]
+        live = [k for k, (lt, _, _) in tracks.items() if t - lt <= max_gap_s]
+        ids = [None] * len(pts)
+        if players and live:
+            D = np.array([[np.hypot(pts[i][1] - tracks[k][1], pts[i][2] - tracks[k][2]) for k in live]
+                          for i in players])
+            r, c = linear_sum_assignment(D)
+            for a, b in zip(r, c):
+                if D[a, b] <= gate * max(1.0, (t - tracks[live[b]][0]) / 0.5):
+                    ids[players[a]] = live[b]
+        new = []
+        for i, p in enumerate(pts):
+            if p[3]:
+                new.append((-1,) + tuple(p[1:]))
+                continue
+            if ids[i] is None:
+                ids[i] = next_id
+                next_id += 1
+            tracks[ids[i]] = (t, p[1], p[2])
+            new.append((ids[i],) + tuple(p[1:]))
+        out.append((t, new))
+    return out
 
 
 def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
@@ -645,6 +694,7 @@ def process(inp):
         placed.append((tt, keep))
         cal_flags.append(Hf is not None or H is not None)
 
+    placed = assign_ids(placed)
     cols = np.array([p[4] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
     if len(cols) >= 4:
