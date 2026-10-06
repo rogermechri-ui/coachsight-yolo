@@ -311,103 +311,115 @@ def video_end(cap):
     return n / vfps if n > 0 and vfps > 0 else None
 
 
-def _pitch_chunk(camera, L, W, q, out):
-    """Processus de calage d'une tranche du match (images dans l'ordre)."""
+def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
+    """Processus de calage d'une tranche du match : il lit lui-meme sa partie de
+    la video (decodage en parallele) et renvoie l'homographie de chaque image
+    analysee, reperee par son instant t (memes instants que la detection)."""
     cv2.setNumThreads(1)
     tracker = pitch_track.PitchTracker(camera, L, W)
     H, size, err, n_full = {}, None, None, 0
-    while True:
-        kind, img, idx = q.get()
-        if kind == "stop":
-            break
-        if err:
-            continue
-        try:
-            if kind == "reset":                # nouvelle periode : la camera a pu bouger
+    t0 = time.time()
+    try:
+        cap = cv2.VideoCapture(source)
+        last_w = None
+        for ws, we, wid, a, b in slices:
+            if last_w is not None and wid != last_w:      # nouvelle periode : la camera a pu bouger
                 tracker.p = None
                 tracker.feat = None
-                continue
-            size = (img.shape[1], img.shape[0])
-            if kind == "motion":
-                tracker.motion(img)
-                continue
-            # image analysee : recalage sur les lignes une fois sur N, sinon mouvement seul
-            if n_full % PITCH_FULL_EVERY == 0 or tracker.p is None:
-                h, s = tracker.full(img)
-            else:
-                tracker.motion(img)
-                h, s = tracker.current(), None
-            n_full += 1
-            H[idx] = (None if h is None else h.tolist(), s)
-        except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
-            err = "%s: %s" % (type(e).__name__, str(e)[:200])
-    out.put({"H": H, "size": size, "error": err, "stats": tracker.stats})
+            last_w = wid
+            for j, (t, frame) in enumerate(iter_frames(cap, ws, we, fps_out * k)):
+                img = pitch_track.to_work(frame)
+                size = (img.shape[1], img.shape[0])
+                if j % k:
+                    tracker.motion(img)
+                    continue
+                if n_full % PITCH_FULL_EVERY == 0 or tracker.p is None:
+                    h, s = tracker.full(img)
+                else:
+                    tracker.motion(img)
+                    h, s = tracker.current(), None
+                n_full += 1
+                if a - 1e-6 <= t <= b + 1e-6:      # les secondes d'avant ne servent qu'a demarrer
+                    H[round(t, 2)] = (None if h is None else h.tolist(), s)
+        cap.release()
+    except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
+        err = "%s: %s" % (type(e).__name__, str(e)[:200])
+    st = dict(tracker.stats)
+    st["wall_s"] = time.time() - t0
+    out.put({"H": H, "size": size, "error": err, "stats": st})
 
 
 class PitchWorker:
-    """Calage du terrain en tache de fond, pendant que le GPU detecte les joueurs.
-    Le match est coupe en PITCH_PROCS tranches calees en parallele (un processus
-    par tranche, chacun se cale seul au debut de sa tranche). Pour chaque image
-    analysee, garde l'homographie terrain -> image (ou None)."""
+    """Calage du terrain en parallele de la detection des joueurs (GPU).
+    Le match est coupe en PITCH_PROCS tranches de temps de jeu ; chaque processus
+    relit sa tranche de la video et la cale seul (il se cale au debut de sa
+    tranche). Resultat : l'homographie terrain -> image de chaque image analysee."""
 
-    def __init__(self, camera, L, W, windows):
+    def __init__(self, camera, L, W, windows, source, fps_out):
         import multiprocessing as mp
         ctx = mp.get_context("fork")     # pas "spawn" : il rechargerait tout le moteur
         total = sum(we - ws for ws, we in windows)
         n = max(1, min(PITCH_PROCS, int(total // 120) or 1))    # au moins 2 min par tranche
-        self.windows = windows
-        self.bounds = [total * k / n for k in range(1, n)]
+        k = max(1, int(round(MOTION_FPS / fps_out)))
+        step = total / n
+        # Tranches : chaque processus recoit des morceaux (debut lecture, fin lecture,
+        # periode, debut garde, fin garde). La lecture commence 3 s avant le debut
+        # garde pour que le mouvement de la camera soit deja suivi.
+        slices = [[] for _ in range(n)]
+        played = 0.0
+        for wid, (ws, we) in enumerate(windows):
+            for c in range(n):
+                a_play, b_play = c * step, (c + 1) * step
+                lo, hi = max(a_play, played), min(b_play, played + (we - ws))
+                if hi - lo > 1e-6:
+                    a, b = ws + (lo - played), ws + (hi - played)
+                    slices[c].append((max(ws, a - 3.0) if a > ws else ws, b, wid, a, b))
+            played += we - ws
+        # Les instants analyses doivent etre ceux de la detection : on lit chaque
+        # morceau depuis le debut de sa periode n'est pas necessaire, iter_frames
+        # part de ws ; on aligne donc le debut de lecture sur la grille 1/fps_out.
+        grid = 1.0 / (fps_out * k)
+        aligned = []
+        for sl in slices:
+            al = []
+            for ws_read, b, wid, a, bb in sl:
+                w0 = windows[wid][0]
+                ws_read = w0 + np.floor((ws_read - w0) / (1.0 / fps_out) + 1e-9) * (1.0 / fps_out)
+                al.append((ws_read, b, wid, a, bb))
+            aligned.append(al)
         self.out = ctx.Queue()
-        self.qs = [ctx.Queue(maxsize=24) for _ in range(n)]
-        self.procs = [ctx.Process(target=_pitch_chunk, args=(camera, L, W, q, self.out), daemon=True)
-                      for q in self.qs]
+        self.procs = [ctx.Process(target=_pitch_slice, args=(camera, L, W, source, sl, fps_out, k, self.out),
+                                  daemon=True) for sl in aligned if sl]
         for pr in self.procs:
             pr.start()
-        self.last = [None] * n            # derniere periode vue par chaque tranche
-        self.H, self.size, self.error = {}, None, None
-        self.stats = {}
-
-    def _chunk(self, t):
-        played = 0.0
-        for k, (ws, we) in enumerate(self.windows):
-            if t <= we or k == len(self.windows) - 1:
-                played += max(0.0, min(t, we) - ws)
-                return sum(1 for b in self.bounds if played >= b), k
-            played += we - ws
-        return len(self.qs) - 1, len(self.windows) - 1
-
-    def put(self, kind, frame=None, idx=None, t=0.0):
-        c, w = self._chunk(t)
-        if self.last[c] is not None and self.last[c] != w:
-            self.qs[c].put(("reset", None, None))
-        self.last[c] = w
-        # Image reduite tout de suite : file d'attente legere (2 Mo par image).
-        self.qs[c].put((kind, pitch_track.to_work(frame), idx))
+        self.H, self.size, self.error, self.stats = {}, None, None, {}
 
     def finish(self):
-        for q in self.qs:
-            q.put(("stop", None, None))
         errors = []
-        for _ in self.qs:
+        walls = []
+        for _ in self.procs:
             try:
-                r = self.out.get(timeout=1800)
+                r = self.out.get(timeout=3600)
             except Exception:
                 errors.append("pitch process lost")
                 continue
-            self.H.update({i: (None if h is None else np.array(h), s) for i, (h, s) in r["H"].items()})
+            self.H.update({t: (None if h is None else np.array(h), s) for t, (h, s) in r["H"].items()})
             self.size = self.size or r["size"]
             if r["error"]:
                 errors.append(r["error"])
-            for k, v in r["stats"].items():
-                self.stats[k] = self.stats.get(k, 0) + v
+            st = r["stats"]
+            walls.append(st.pop("wall_s", 0))
+            for key, v in st.items():
+                self.stats[key] = self.stats.get(key, 0) + v
         for pr in self.procs:
             pr.join(timeout=10)
         self.error = "; ".join(errors) or None
-        self.stats["processes"] = len(self.qs)
+        self.stats["processes"] = len(self.procs)
+        self.stats["slowest_s"] = round(max(walls), 1) if walls else 0
         return self.H
 
 
-def track(cap, windows, fps_out, timings, pitch=None):
+def track(cap, windows, fps_out, timings):
     """Detection + suivi des joueurs et du ballon dans chaque periode de jeu.
     Les positions sont gardees en coordonnees d'image normalisees (0..1) :
     la conversion en metres se fait ensuite (calage du terrain si fourni).
@@ -418,18 +430,11 @@ def track(cap, windows, fps_out, timings, pitch=None):
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
-    k = max(1, int(round(MOTION_FPS / fps_out))) if pitch else 1
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
     for ws, we in windows:
         clock = time.time()
-        for j, (t, frame) in enumerate(iter_frames(cap, ws, we, fps_out * k)):
+        for t, frame in iter_frames(cap, ws, we, fps_out):
             t_read += time.time() - clock
-            if j % k:
-                pitch.put("motion", frame, None, t)
-                clock = time.time()
-                continue
-            if pitch:
-                pitch.put("full", frame, len(raw), t)
             h, w = frame.shape[:2]
             c = time.time()
             if crop is None:
@@ -680,8 +685,8 @@ def process(inp):
         notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
     camera = pitch_camera(inp)
     clock = time.time()
-    worker = PitchWorker(camera, L, W, windows) if camera is not None else None
-    raw, votes = track(cap, windows, fps_out, timings, worker)
+    worker = PitchWorker(camera, L, W, windows, tmp or url, fps_out) if camera is not None else None
+    raw, votes = track(cap, windows, fps_out, timings)
     expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
@@ -693,14 +698,16 @@ def process(inp):
         timings["video_mode"] = "download"
         if worker:
             worker.finish()
-            worker = PitchWorker(camera, L, W, windows)
-        raw, votes = track(cap, windows, fps_out, timings, worker)
+            worker = PitchWorker(camera, L, W, windows, tmp, fps_out)
+        raw, votes = track(cap, windows, fps_out, timings)
     timings["tracking_s"] = round(time.time() - clock, 1)
     per_frame_H, pitch_info = {}, None
     if worker:
         c = time.time()
-        per_frame_H = worker.finish()
+        by_t = worker.finish()
+        per_frame_H = {i: by_t.get(round(t, 2), (None, None)) for i, (t, _) in enumerate(raw)}
         timings["pitch_wait_s"] = round(time.time() - c, 1)     # attente du calage apres le suivi
+        timings["pitch_slowest_s"] = worker.stats.get("slowest_s")
         st = worker.stats
         timings["pitch_s"] = round(st.get("time_s", 0), 1)          # temps de calcul cumule (toutes tranches)
         timings["pitch_global_s"] = round(st.get("global_s", 0), 1)
@@ -790,6 +797,8 @@ def process(inp):
         tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
+    # Trace dans les journaux RunPod (onglet Logs) : temps et calage de chaque analyse.
+    print("ANALYSIS_SUMMARY " + json.dumps({"timings": timings, "pitch_calibration": calibration}), flush=True)
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
             "frames_zip": frames_zip, "team_colors": team_colors, "play_windows": windows,
             "pitch_calibration": calibration, "tactical": tactical,
