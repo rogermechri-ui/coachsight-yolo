@@ -242,11 +242,11 @@ def local_search(v, model, C, p, dp=(1.0, 0.4, 0.04), cx=640.0, cy=268.0):
     return best_p, best_s
 
 
-def global_search(v, model, C, cx=640.0, cy=268.0, keep=24):
+def global_search(v, model, C, cx=640.0, cy=268.0, keep=16):
     """Recherche sur tous les reglages possibles (demarrage, ou camera perdue)."""
-    th = np.radians(np.arange(-100, 100.1, 2.5))
-    ph = np.radians(np.arange(F_TILT[0], F_TILT[1] + 0.1, 0.75))
-    fs = np.geomspace(F_RANGE[0], F_RANGE[1], 16)
+    th = np.radians(np.arange(-100, 100.1, 3.0))
+    ph = np.radians(np.arange(F_TILT[0], F_TILT[1] + 0.1, 1.0))
+    fs = np.geomspace(F_RANGE[0], F_RANGE[1], 13)
     cands = []
     TH, PH = np.meshgrid(th, ph, indexing='ij')
     base = np.column_stack([TH.ravel(), PH.ravel()])
@@ -343,7 +343,7 @@ class PitchTracker:
     - full(img) : image analysee, mouvement + recalage sur les lignes ; renvoie
       l'homographie terrain -> image (pixels de travail) ou None, et le score."""
 
-    def __init__(self, camera, L, W, verify_every=10, global_every=8):
+    def __init__(self, camera, L, W, verify_every=30, global_every=8):
         self.C = np.asarray(camera, float)
         self.model = PitchModel(L, W)
         self.p = None
@@ -402,7 +402,10 @@ class PitchTracker:
     def _global(self, v, cx, cy):
         self.last_global = self.full_n
         self.stats["global_searches"] += 1
-        return global_search(v, self.model, self.C, cx, cy)
+        t = time.time()
+        g = global_search(v, self.model, self.C, cx, cy)
+        self.stats["global_s"] = self.stats.get("global_s", 0.0) + time.time() - t
+        return g
 
     def full(self, img):
         t0 = time.time()
@@ -422,7 +425,7 @@ class PitchTracker:
             self.lost = False
             # Verification de temps en temps : recherche complete gardee seulement
             # si elle colle nettement mieux.
-            if score > 1.2 and self.full_n - self.last_global >= self.verify_every:
+            if score > 1.4 and self.full_n - self.last_global >= self.verify_every:
                 g = self._global(v, cx, cy)
                 if g and g[1] < 1.0 and g[1] < score - 0.3:
                     self.p, score = g[0], g[1]
