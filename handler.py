@@ -270,14 +270,33 @@ def collect_frames(cap, inp, windows, source=None):
     return collector.upload()
 
 
-def download(url):
+def download(url, attempts=5):
+    """Copie locale de la video. Si la connexion coupe en cours de route (gros
+    fichiers de plusieurs Go), on reprend la ou on s'etait arrete (en-tete Range)
+    au lieu d'echouer."""
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    with requests.get(url, stream=True, timeout=600) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-    return tmp
+    done, total = 0, None
+    for k in range(attempts):
+        headers = {"Range": "bytes=%d-" % done} if done else {}
+        try:
+            with requests.get(url, stream=True, timeout=600, headers=headers) as r:
+                r.raise_for_status()
+                if done and r.status_code != 206:      # le serveur ignore Range : on repart de zero
+                    done = 0
+                if total is None:
+                    size = r.headers.get("Content-Length")
+                    total = (int(size) + done) if size else None
+                with open(tmp, "ab" if done else "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+                        done += len(chunk)
+            if total is None or done >= total:
+                return tmp
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            print("download interrupted at %d bytes (%s), retry %d" % (done, type(e).__name__, k + 1), flush=True)
+        time.sleep(2 + 3 * k)
+    raise RuntimeError("video download failed after %d attempts (%d bytes of %s)" % (attempts, done, total))
 
 
 def open_video(url, start):
