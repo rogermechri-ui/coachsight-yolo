@@ -660,12 +660,15 @@ def split_at_side_switch(frames, windows):
         total = before[-1]
         # Accord si l'on coupe apres i : |somme avant| + |somme apres|.
         gain = np.abs(before[:-1]) + np.abs(total - before[:-1])
-        lo, hi = int(0.2 * len(s)), int(0.8 * len(s))
+        lo, hi = int(0.15 * len(s)), int(0.85 * len(s))
         i = lo + int(np.argmax(gain[lo:hi]))
         n1, n2 = i + 1, len(s) - i - 1
-        a1, a2 = before[i] / n1, (total - before[i]) / n2
-        # Coupure retenue si chaque partie a un cote net (>= 70 % d'accord) et oppose.
-        if a1 * a2 < 0 and abs(a1) >= 0.4 and abs(a2) >= 0.4:
+        s1, s2 = before[i], total - before[i]
+        # Coupure retenue si les deux parties ont chacune un cote net et oppose :
+        # au moins 60 % d'accord et un ecart bien au-dela du hasard (3 sigmas).
+        # (Mesure sur ce match : 83 % en 1re mi-temps, 68 % en 2e.)
+        if (s1 * s2 < 0 and abs(s1) / n1 >= 0.2 and abs(s2) / n2 >= 0.2
+                and abs(s1) >= 3 * np.sqrt(n1) and abs(s2) >= 3 * np.sqrt(n2)):
             cut = round((ts[i] + ts[i + 1]) / 2, 1)
             out += [[ws, cut], [cut, we]]
         else:
@@ -1190,7 +1193,15 @@ def notify(inp, **fields):
 def summarize(result):
     """Resume d'une analyse (sans les positions image par image), pour un test
     lance directement depuis la console RunPod, sans l'application."""
-    return {"timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
+    # Par tranche de 5 min : part des images ou l'equipe 0 est a gauche de
+    # l'equipe 1 (controle du changement de cote a la mi-temps).
+    side = {}
+    for f in result.get("frames", []):
+        xs = {tm: [p["x"] for p in f["points"] if not p["ball"] and p["team"] == tm] for tm in (0, 1)}
+        if f.get("calibrated") and len(xs[0]) >= 4 and len(xs[1]) >= 4:
+            side.setdefault(int(f["t"] // 300) * 5, []).append(np.mean(xs[0]) < np.mean(xs[1]))
+    timeline = {"%d min" % k: "%d%% (%d)" % (round(100 * np.mean(v)), len(v)) for k, v in sorted(side.items())}
+    return {"team0_left_by_5min": timeline,"timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
             "tactical": result.get("tactical"), "total_frames": result.get("total_frames"),
             "tracks": len(result.get("tracks", [])), "ball_frames": result.get("ball_frames"),
             "players_per_frame_median": float(np.median([len(f["points"]) for f in result.get("frames", [])] or [0]))}
