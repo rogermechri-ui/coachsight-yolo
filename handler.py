@@ -84,7 +84,11 @@ def shirt_color(frame, box):
     keep = lab[~grass]
     if len(keep) < max(4, 0.15 * len(lab)):
         return None   # presque tout est de la pelouse : mesure non fiable
-    return np.median(keep, axis=0)
+    # Clarte : 90e centile plutot que la mediane. Un joueur lointain en maillot
+    # clair se melange aux panneaux sombres derriere lui ; sa mediane le classait
+    # dans l'equipe en maillot fonce.
+    return np.array([np.percentile(keep[:, 0], 90), np.median(keep[:, 1]), np.median(keep[:, 2])],
+                    dtype=np.float32)
 
 
 def read_number(frame, box):
@@ -552,6 +556,7 @@ def pitch_camera(inp):
 # voit qu'une partie du terrain a chaque instant).
 MEMORY_S = float(os.environ.get("PLAYER_MEMORY_S", "6"))
 TACTICAL_MIN_PLAYERS = int(os.environ.get("TACTICAL_MIN_PLAYERS", "8"))
+TEAM_HUE_MIN = float(os.environ.get("TEAM_HUE_MIN", "20"))   # ecart de teinte (Lab a,b) accepte
 
 
 def assign_ids(placed, gate=4.0, max_gap_s=1.5):
@@ -626,6 +631,48 @@ def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
     return out
 
 
+KEEPER_GAP_M = 8.0
+SIDE_SWITCH_MIN_S = 50 * 60     # une periode plus longue contient sans doute les deux mi-temps
+
+
+def split_at_side_switch(frames, windows):
+    """Les equipes changent de cote a la mi-temps. Une periode de plus de 50 min
+    (match entier envoye d'un bloc) est coupee au moment ou l'ordre gauche/droite
+    des deux equipes s'inverse durablement ; sinon elle reste entiere."""
+    out = []
+    for ws, we in windows:
+        if we - ws < SIDE_SWITCH_MIN_S:
+            out.append([ws, we])
+            continue
+        ts, sides = [], []
+        for f in frames:
+            if not ws <= f["t"] <= we:
+                continue
+            xs = {tm: [p["x"] for p in f["points"] if not p["ball"] and p["team"] == tm] for tm in (0, 1)}
+            if len(xs[0]) >= 4 and len(xs[1]) >= 4:
+                ts.append(f["t"])
+                sides.append(1 if np.mean(xs[0]) < np.mean(xs[1]) else -1)
+        if len(sides) < 200:
+            out.append([ws, we])
+            continue
+        s = np.array(sides)
+        before = np.cumsum(s)                      # somme des signes jusqu'a i inclus
+        total = before[-1]
+        # Accord si l'on coupe apres i : |somme avant| + |somme apres|.
+        gain = np.abs(before[:-1]) + np.abs(total - before[:-1])
+        lo, hi = int(0.2 * len(s)), int(0.8 * len(s))
+        i = lo + int(np.argmax(gain[lo:hi]))
+        n1, n2 = i + 1, len(s) - i - 1
+        a1, a2 = before[i] / n1, (total - before[i]) / n2
+        # Coupure retenue si chaque partie a un cote net (>= 70 % d'accord) et oppose.
+        if a1 * a2 < 0 and abs(a1) >= 0.4 and abs(a2) >= 0.4:
+            cut = round((ts[i] + ts[i + 1]) / 2, 1)
+            out += [[ws, cut], [cut, we]]
+        else:
+            out.append([ws, we])
+    return out
+
+
 def tactical_metrics(frames, windows, L, W, min_players=6):
     """Indicateurs par periode et par equipe (groupes 0 et 1), a partir des
     positions en metres (necessite un terrain cale) :
@@ -633,7 +680,7 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
     et part du jeu dans chaque tiers. Le gardien (joueur le plus proche de son
     but) est exclu des mesures de bloc."""
     out = []
-    for ws, we in windows:
+    for ws, we in split_at_side_switch(frames, windows):
         fr = [f for f in frames if ws <= f["t"] <= we]
         per_team = {0: [], 1: []}
         for f in fr:
@@ -653,7 +700,9 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
             lines, widths, lengths, thirds = [], [], [], [0, 0, 0]
             for xs in per_team[team]:
                 d = sorted(((x if own_left else L - x), y) for x, y in xs)   # distance a son propre but
-                outfield = d[1:]                                               # sans le gardien
+                # Gardien : joueur le plus en retrait, nettement detache du suivant
+                # (le gardien en maillot different est deja sans equipe).
+                outfield = d[1:] if d[1][0] - d[0][0] >= KEEPER_GAP_M else d
                 lines.append(float(np.mean([p[0] for p in outfield[:3]])))
                 ys = [p[1] for p in outfield]
                 widths.append(max(ys) - min(ys))
@@ -766,19 +815,37 @@ def process(inp):
     placed = assign_ids(placed)
     cols = np.array([p[4] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
     centers = None
+    hue_limit = None
     if len(cols) >= 4:
-        _, _, centers = cv2.kmeans(cols, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0), 3, cv2.KMEANS_PP_CENTERS)
+        _, labels, centers = cv2.kmeans(cols, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0), 3, cv2.KMEANS_PP_CENTERS)
+        # Arbitres (jaune fluo), gardiens et remplacants en chasuble : teinte tres
+        # differente des deux maillots -> sans equipe (sinon ils gonflent une equipe).
+        hue_d = np.linalg.norm(cols[:, 1:] - centers[labels.ravel()][:, 1:], axis=1)
+        hue_limit = max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d)))
     # Numero retenu par piste : celui le plus souvent lu (vote majoritaire).
     numbers = {tid: c.most_common(1)[0][0] for tid, c in votes.items()}
+    def color_team(col):
+        if col is None or centers is None:
+            return None
+        k = int(np.argmin(np.linalg.norm(centers - col, axis=1)))
+        return k if np.linalg.norm(np.asarray(col)[1:] - centers[k][1:]) <= hue_limit else None
+
+    # Equipe de chaque piste : vote sur toutes ses images (une image a l'ombre ou
+    # un joueur masque ne change pas d'equipe) ; sans equipe si le plus souvent
+    # hors des deux maillots (arbitre, gardien).
+    team_votes = {}
+    for _, pts in placed:
+        for tid, x, y, ball, col in pts:
+            if not ball and tid >= 0 and col is not None:
+                team_votes.setdefault(tid, Counter())[color_team(col)] += 1
+    track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
     tracks = []
     seen = {}
     frames = []
     for (tt, pts), cal in zip(placed, cal_flags):
         out = []
         for tid, x, y, ball, col in pts:
-            team = None
-            if col is not None and centers is not None:
-                team = int(np.argmin(np.linalg.norm(centers - col, axis=1)))
+            team = track_team.get(tid) if tid >= 0 else color_team(col)
             num = None if ball else numbers.get(tid)
             out.append({
                 "trackId": tid, "team": team,
