@@ -683,20 +683,24 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
     et part du jeu dans chaque tiers. Le gardien (joueur le plus proche de son
     but) est exclu des mesures de bloc."""
     out = []
+    periods = []
     for ws, we in split_at_side_switch(frames, windows):
         fr = [f for f in frames if ws <= f["t"] <= we]
         per_team = {0: [], 1: []}
+        votes = []          # par image ou les deux equipes sont visibles : equipe 0 a gauche ?
         for f in fr:
+            xs = {team: [(p["x"], p["y"]) for p in f["points"] if not p["ball"] and p["team"] == team] for team in (0, 1)}
             for team in (0, 1):
-                xs = [(p["x"], p["y"]) for p in f["points"] if not p["ball"] and p["team"] == team]
-                if len(xs) >= min_players:
-                    per_team[team].append(xs)
+                if len(xs[team]) >= min_players:
+                    per_team[team].append(xs[team])
+            if len(xs[0]) >= 4 and len(xs[1]) >= 4:
+                votes.append(np.mean([p[0] for p in xs[0]]) < np.mean([p[0] for p in xs[1]]))
+        periods.append((ws, we, per_team, votes))
+    sides = side_per_period(periods)
+    for (ws, we, per_team, votes), (left, conf) in zip(periods, sides):
         if not per_team[0] or not per_team[1]:
             out.append({"window": [ws, we], "frames_used": 0, "teams": {}})
             continue
-        # Cote defendu : l'equipe dont le centre moyen est le plus a gauche defend x = 0.
-        mean_x = {t: float(np.mean([np.mean([p[0] for p in xs]) for xs in per_team[t]])) for t in (0, 1)}
-        left = 0 if mean_x[0] <= mean_x[1] else 1
         teams = {}
         for team in (0, 1):
             own_left = team == left
@@ -722,8 +726,48 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
                                          "attacking": round(100 * thirds[2] / n)},
                 "defends": "left" if own_left else "right",
             }
-        out.append({"window": [ws, we], "frames_used": min(len(per_team[0]), len(per_team[1])), "teams": teams})
+        out.append({"window": [ws, we], "frames_used": min(len(per_team[0]), len(per_team[1])), "teams": teams,
+                    "side_confidence_pct": round(100 * abs(conf)),
+                    "side_source": "other_half" if conf < 0 else "frames"})
     return out
+
+
+def side_per_period(periods):
+    """Quel but defend l'equipe 0 dans chaque periode. Vote image par image (les
+    deux equipes visibles) ; confiance = part des images d'accord. Les equipes
+    changent de cote a la mi-temps : la periode la plus sure fixe les autres,
+    en alternant a chaque coupure de plus de HALF_GAP_S (pause). Renvoie
+    [(equipe a gauche, confiance)] ; sans vote fiable, cote tire des positions
+    moyennes."""
+    res = []
+    for ws, we, per_team, votes in periods:
+        if len(votes) >= 50:
+            share = float(np.mean(votes))
+            res.append([0 if share >= 0.5 else 1, abs(share - 0.5) * 2])
+        elif per_team[0] and per_team[1]:
+            mean_x = {t: float(np.mean([np.mean([p[0] for p in xs]) for xs in per_team[t]])) for t in (0, 1)}
+            res.append([0 if mean_x[0] <= mean_x[1] else 1, 0.0])
+        else:
+            res.append([0, 0.0])
+    if len(periods) < 2:
+        return [tuple(r) for r in res]
+    # Numero de mi-temps de chaque periode (change apres une pause).
+    half = [0]
+    for (_, prev_end, _, _), (ws, _, _, _) in zip(periods, periods[1:]):
+        # Pause longue, ou coupure posee par split_at_side_switch (periodes jointives).
+        half.append(half[-1] + (1 if ws - prev_end >= HALF_GAP_S or ws == prev_end else 0))
+    best = int(np.argmax([r[1] for r in res]))
+    if res[best][1] >= SIDE_MIN_CONF:
+        for i, r in enumerate(res):
+            if r[1] < SIDE_MIN_CONF:
+                flip = (half[i] - half[best]) % 2
+                r[0] = res[best][0] ^ flip
+                r[1] = -res[best][1]        # negatif : cote deduit de l'autre mi-temps
+    return [tuple(r) for r in res]
+
+
+HALF_GAP_S = 5 * 60       # coupure entre deux periodes consideree comme une mi-temps
+SIDE_MIN_CONF = 0.4       # 70 % des images d'accord
 
 
 def process(inp):
