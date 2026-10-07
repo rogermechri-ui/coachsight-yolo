@@ -1110,6 +1110,8 @@ def prepare(inp):
 
 def notify(inp, **fields):
     """Message intermediaire vers l'application (n'interrompt jamais le travail)."""
+    if not inp.get("callback_url"):
+        return
     try:
         body = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
         body.update(fields)
@@ -1118,8 +1120,25 @@ def notify(inp, **fields):
         pass
 
 
+def summarize(result):
+    """Resume d'une analyse (sans les positions image par image), pour un test
+    lance directement depuis la console RunPod, sans l'application."""
+    return {"timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
+            "tactical": result.get("tactical"), "total_frames": result.get("total_frames"),
+            "tracks": len(result.get("tracks", [])), "ball_frames": result.get("ball_frames"),
+            "players_per_frame_median": float(np.median([len(f["points"]) for f in result.get("frames", [])] or [0]))}
+
+
 def handler(job):
     inp = job["input"]
+    if not inp.get("callback_url"):
+        # Test direct (console RunPod) : pas d'application a prevenir, on renvoie un resume.
+        if inp.get("task"):
+            return {"status": "failed", "error": "direct test supports the default analysis only"}
+        try:
+            return {"status": "completed", "summary": summarize(process(inp))}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)[:900]}
     cb = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
     if inp.get("task") == "label_batch":
         try:
