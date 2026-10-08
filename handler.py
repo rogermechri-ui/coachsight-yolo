@@ -1056,10 +1056,29 @@ def process(inp):
             if not ball and tid >= 0 and col is not None:
                 team_votes.setdefault(tid, Counter())[color_team(col)] += 1
     track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
+    # Vue de chaque image pour les dessins tactiques cote site : homographie
+    # terrain (metres) -> image (0..1), 9 nombres, H[2][2] = 1 ; None sans calage.
+    def view_of(i):
+        Hv = per_frame_H.get(i, (None, None))[0] if per_frame_H else None
+        if Hv is not None:
+            w, h = worker.size
+            Hv = np.diag([1.0 / w, 1.0 / h, 1.0]) @ np.asarray(Hv, dtype=float)
+        elif H is not None:
+            try:
+                Hv = np.linalg.inv(H)
+            except np.linalg.LinAlgError:
+                return None
+        else:
+            return None
+        if not np.all(np.isfinite(Hv)) or abs(Hv[2, 2]) < 1e-12:
+            return None
+        Hv = Hv / Hv[2, 2]
+        return [float("%.6g" % v) for v in Hv.ravel()]
+
     tracks = []
     seen = {}
     frames = []
-    for (tt, pts), cal in zip(placed, cal_flags):
+    for i, ((tt, pts), cal) in enumerate(zip(placed, cal_flags)):
         out = []
         for tid, x, y, ball, col in pts:
             team = track_team.get(tid) if tid >= 0 else color_team(col)
@@ -1073,7 +1092,7 @@ def process(inp):
             if not ball and tid >= 0 and tid not in seen:
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
-        frames.append({"t": tt, "points": out, "calibrated": bool(cal)})
+        frames.append({"t": tt, "points": out, "calibrated": bool(cal), "view": view_of(i)})
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
