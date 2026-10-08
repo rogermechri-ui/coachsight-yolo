@@ -536,7 +536,7 @@ def to_pitch(H, u, v, L, W):
     return p[0] / p[2], p[1] / p[2]
 
 
-CAMERA_SEGMENTS = int(os.environ.get("CAMERA_SEGMENTS", "3"))      # passages de la video etudies
+CAMERA_SEGMENTS = int(os.environ.get("CAMERA_SEGMENTS", "4"))      # passages de la video etudies
 CAMERA_SEGMENT_S = float(os.environ.get("CAMERA_SEGMENT_S", "30"))  # duree de chaque passage
 CAMERA_FPS = 6.0
 

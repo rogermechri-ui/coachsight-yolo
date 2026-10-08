@@ -456,6 +456,7 @@ CAMERA_PRIOR = (0.5, 4.0, 4.5)   # (part de L, metres derriere la touche, hauteu
 CAMERA_MAX_VIEWS = 60
 CAMERA_MAX_SCORE = 1.1            # au-dela, la position trouvee n'est pas retenue
 CAMERA_HEIGHTS = (2.5, 4.5, 7.0)  # departs en hauteur (m)
+CAMERA_BOUNDS = ((0.3, 0.7), (1.0, 12.0), (2.0, 9.0))  # x (part de L), recul derriere la touche, hauteur
 
 
 def _bilinear(img, x, y):
@@ -549,17 +550,30 @@ def estimate_camera(frames, L, W, prior=None, max_views=CAMERA_MAX_VIEWS, log=pr
         Pz = np.array([local_search(v, model, Cz, P0[k], dp=(2.0, 1.0, 0.08), cx=cx, cy=cy)[0]
                        for k, v in enumerate(views)])
         x0 = np.concatenate([Cz, (Pz / np.array([1.0, 1.0, 1000.0])).ravel()])
-        r = least_squares(_joint_residuals, x0, args=(views, model, cx, cy), method='trf',
+        # Bornes : poses realistes d'une camera de bord de terrain (la vallee plate
+        # "plus haut et plus loin" ne doit pas emmener la solution n'importe ou).
+        lo = np.concatenate([[CAMERA_BOUNDS[0][0] * L, W + CAMERA_BOUNDS[1][0], CAMERA_BOUNDS[2][0]],
+                             np.full(len(x0) - 3, -np.inf)])
+        hi = np.concatenate([[CAMERA_BOUNDS[0][1] * L, W + CAMERA_BOUNDS[1][1], CAMERA_BOUNDS[2][1]],
+                             np.full(len(x0) - 3, np.inf)])
+        r = least_squares(_joint_residuals, np.clip(x0, lo + 1e-6, hi - 1e-6), bounds=(lo, hi),
+                          args=(views, model, cx, cy), method='trf',
                           loss='soft_l1', f_scale=0.3, max_nfev=40, x_scale='jac')
-        if best is None or r.cost < best[0]:
-            best = (r.cost, r.x)
-    C = best[1][:3]
-    P = best[1][3:].reshape(-1, 3) * np.array([1.0, 1.0, 1000.0])
-    s1 = mean_score(views, model, C, P, cx, cy)
+        Cr = r.x[:3]
+        Pr = r.x[3:].reshape(-1, 3) * np.array([1.0, 1.0, 1000.0])
+        sr = mean_score(views, model, Cr, Pr, cx, cy)
+        if best is None or sr < best[0]:
+            best = (sr, Cr, Pr)
+    s1, C, P = best
     info.update(views=len(views), fit_s=round(time.time() - t1, 1),
                 score_prior=round(s0, 3), score=round(s1, 3), camera=[round(float(c), 2) for c in C])
     log("camera estimate: %s score %.3f (prior %.3f) from %d views" % (info["camera"], s1, s0, len(views)))
-    if s1 > CAMERA_MAX_SCORE or not (0 < C[0] < L and W < C[1] < W + 40 and 1.0 < C[2] < 25.0):
+    if s1 > CAMERA_MAX_SCORE:
         info["error"] = "camera fit not convincing"
         return None, info
+    if s1 > s0 - 0.005:
+        # L'ajustement n'a pas fait mieux que la pose a priori : on la garde.
+        info["note"] = "prior kept (fit not better)"
+        info["camera"] = info["prior"]
+        return C0, info
     return C, info
