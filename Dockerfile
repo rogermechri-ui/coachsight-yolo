@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 tesseract-ocr ffmpeg && rm -rf /var/lib/apt/lists/*
 # Donne acces a la puce video du GPU (encodage NVENC) pour la copie allegee.
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
