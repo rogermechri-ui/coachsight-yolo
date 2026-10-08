@@ -536,20 +536,61 @@ def to_pitch(H, u, v, L, W):
     return p[0] / p[2], p[1] / p[2]
 
 
+CAMERA_SEGMENTS = int(os.environ.get("CAMERA_SEGMENTS", "3"))      # passages de la video etudies
+CAMERA_SEGMENT_S = float(os.environ.get("CAMERA_SEGMENT_S", "30"))  # duree de chaque passage
+CAMERA_FPS = 6.0
+
+
+def camera_frames(source, windows, n=CAMERA_SEGMENTS, dur=CAMERA_SEGMENT_S, fps=CAMERA_FPS):
+    """Images (6/s) de n passages de `dur` secondes repartis dans les periodes de
+    jeu, pour estimer la position de la camera (vues variees : panoramiques, zooms)."""
+    total = sum(we - ws for ws, we in windows)
+    if total <= 0:
+        return
+    marks = [total * (k + 0.5) / n for k in range(n)]
+    cap = cv2.VideoCapture(source)
+    try:
+        for m in marks:
+            acc = 0.0
+            for ws, we in windows:
+                if acc + (we - ws) > m:
+                    a = min(ws + (m - acc), max(ws, we - dur))
+                    for _, frame in iter_frames(cap, a, min(we, a + dur), fps):
+                        yield frame
+                    break
+                acc += we - ws
+    finally:
+        cap.release()
+
+
+def estimate_camera(source, windows, L, W):
+    """Position de la camera estimee sur la video elle-meme (camera fixe type Veo)."""
+    return pitch_track.estimate_camera(camera_frames(source, windows), L, W,
+                                       log=lambda s: print(s, flush=True))
+
+
 def pitch_camera(inp):
     """Position de la camera (metres) : pitch.camera envoye par l'application
-    ({x, y, z} ou [x, y, z]), sinon PITCH_CAMERA ; None = pas de calage auto."""
+    ({x, y, z} ou [x, y, z]), sinon PITCH_CAMERA ; None = pas de calage auto.
+    "auto" (ou rien du tout) : a estimer sur la video."""
     cam = (inp.get("pitch") or {}).get("camera")
+    if cam == "auto":
+        return "auto"
     try:
         if isinstance(cam, dict):
             return np.array([float(cam["x"]), float(cam["y"]), float(cam["z"])])
         if isinstance(cam, (list, tuple)) and len(cam) == 3:
             return np.array([float(c) for c in cam])
+        if PITCH_CAMERA == "auto":
+            return "auto"
         if PITCH_CAMERA:
             return np.array([float(c) for c in PITCH_CAMERA.split(",")])
     except (KeyError, TypeError, ValueError):
         return None
-    return None
+    return "auto" if cam is None and AUTO_CAMERA else None
+
+
+AUTO_CAMERA = os.environ.get("AUTO_CAMERA", "1") == "1"   # sans position connue : estimer sur la video
 
 
 # Memoire des joueurs sortis de l'image (camera Veo qui suit le ballon : on ne
@@ -799,6 +840,12 @@ def process(inp):
     if inp.get("early_frames_callback") and frames_zip.get("uploaded"):
         notify(inp, status="frames_ready", frames_zip=frames_zip, timings=dict(timings))
     camera = pitch_camera(inp)
+    camera_info = {"source": "given"} if camera is not None else {"source": "none"}
+    if isinstance(camera, str):          # "auto" : position estimee sur la video
+        clock = time.time()
+        camera, cinfo = estimate_camera(tmp or url, windows, L, W)
+        camera_info = {"source": "auto", **cinfo}
+        timings["camera_s"] = round(time.time() - clock, 1)
     clock = time.time()
     worker = PitchWorker(camera, L, W, windows, tmp or url, fps_out) if camera is not None else None
     raw, votes = track(cap, windows, fps_out, timings)
@@ -914,9 +961,13 @@ def process(inp):
             team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
     calibration = {"calibrated": H is not None, "points": len((inp.get("pitch_calibration") or {}).get("points") or []),
                    "mean_error_m": round(calib_err, 2) if calib_err is not None else None}
+    calibration["camera_estimate"] = camera_info
     if pitch_info:
         calibration.update(pitch_info)
         calibration["calibrated"] = calibration["calibrated"] or pitch_info["frames_calibrated"] > 0
+    elif camera_info.get("source") == "auto":
+        calibration["method"] = "camera_tracking"
+        calibration["error"] = camera_info.get("error", "camera position not found")
     if pitch_info:
         # Camera qui suit le jeu : equipes reconstituees avec la memoire des joueurs
         # hors champ, et mesures seulement quand l'equipe est presque entiere.

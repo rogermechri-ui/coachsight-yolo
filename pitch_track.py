@@ -448,3 +448,118 @@ def image_to_pitch(H, u, v, w, h):
     if q[2] == 0:
         return None
     return q[0] / q[2], q[1] / q[2]
+
+
+# --- Position de la camera : estimation automatique --------------------------------
+
+CAMERA_PRIOR = (0.5, 4.0, 4.5)   # (part de L, metres derriere la touche, hauteur) : pose Veo typique
+CAMERA_MAX_VIEWS = 60
+CAMERA_MAX_SCORE = 1.1            # au-dela, la position trouvee n'est pas retenue
+CAMERA_HEIGHTS = (2.5, 4.5, 7.0)  # departs en hauteur (m)
+
+
+def _bilinear(img, x, y):
+    x = np.clip(x, 0, img.shape[1] - 1.001)
+    y = np.clip(y, 0, img.shape[0] - 1.001)
+    x0 = np.floor(x).astype(int)
+    y0 = np.floor(y).astype(int)
+    fx, fy = x - x0, y - y0
+    return (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x0 + 1] * fx * (1 - fy)
+            + img[y0 + 1, x0] * (1 - fx) * fy + img[y0 + 1, x0 + 1] * fx * fy)
+
+
+def _joint_residuals(x, views, model, cx, cy):
+    """Ecarts lignes vues <-> terrain pour toutes les vues, derivables (interpolation)."""
+    C = x[:3]
+    P = x[3:].reshape(-1, 3) * np.array([1.0, 1.0, 1000.0])
+    out = []
+    for k, v in enumerate(views):
+        H = homog(C, P[k, 0], P[k, 1], P[k, 2], cx, cy)
+        Hi = np.linalg.inv(H)
+        Q = v.wpts @ Hi.T
+        z = Q[:, 2]
+        with np.errstate(all='ignore'):
+            gx = np.nan_to_num((Q[:, 0] / z + model.PAD) / model.RES)
+            gy = np.nan_to_num((Q[:, 1] / z + model.PAD) / model.RES)
+        okq = (z > 0) & (gx >= 0) & (gx < model.gw - 1) & (gy >= 0) & (gy < model.gh - 1)
+        d = np.minimum(np.where(okq, _bilinear(model.dt, gx, gy), 1.5), 1.5)
+        out.append(d / 1.5 / np.sqrt(max(1, len(d))))
+        S = model.samples @ H.T
+        zs = S[:, 2]
+        with np.errstate(all='ignore'):
+            u = np.nan_to_num(S[:, 0] / zs)
+            vv = np.nan_to_num(S[:, 1] / zs)
+        x0, y0, x1, y1 = v.box
+        ok = (zs > 0) & (u >= x0) & (u < x1 - 1) & (vv >= 0) & (vv < v.h - 1)
+        ui = np.clip(u, 0, v.w - 1).astype(int)
+        vi = np.clip(vv, 0, v.h - 1).astype(int)
+        onf = v.field[vi, ui] > 0
+        dd = np.where(ok & onf, np.minimum(_bilinear(v.dt, u, vv), 15.0), 15.0)
+        out.append(np.where(ok, dd, 0.0) / 15.0 / np.sqrt(max(1, ok.sum())))
+    return np.concatenate(out)
+
+
+def mean_score(views, model, C, P, cx, cy):
+    return float(np.mean([score_batch(v, model, homog_batch(C, P[k:k + 1], cx, cy))[0]
+                          for k, v in enumerate(views)]))
+
+
+def estimate_camera(frames, L, W, prior=None, max_views=CAMERA_MAX_VIEWS, log=print):
+    """Position de la camera a partir d'images d'un match (camera fixe type Veo).
+
+    frames : iterateur d'images BGR (pleine taille ou de travail), dans l'ordre,
+    environ 6 par seconde de video, sur un ou plusieurs passages du match.
+    1. Suivi du terrain avec une position a priori (ligne mediane, 4 m derriere
+       la touche, 4,5 m de haut) ; une image sur trois est recalee sur les lignes.
+    2. Les images bien calees (jusqu'a max_views, reparties) servent a ajuster
+       ensemble la position de la camera et les reglages de chaque vue.
+    Renvoie (C, infos) ; C = None si le terrain n'a pas pu etre suivi."""
+    pr = prior or CAMERA_PRIOR
+    C0 = np.array([L * pr[0], W + pr[1], pr[2]])
+    model = PitchModel(L, W)
+    tr = PitchTracker(C0, L, W)
+    sel = []
+    t0 = time.time()
+    for i, fr in enumerate(frames):
+        img = to_work(fr)
+        if i % 3:
+            tr.motion(img)
+            continue
+        H, s = tr.full(img)
+        if H is not None and s is not None and s < 1.0 and tr.p is not None:
+            sel.append((img, tr.p.copy(), s))
+    info = {"frames_seen": tr.stats["frames"], "frames_locked": len(sel),
+            "track_s": round(time.time() - t0, 1), "prior": [round(float(c), 2) for c in C0]}
+    if len(sel) < 8:
+        info["error"] = "pitch lines not followed well enough (%d locked frames)" % len(sel)
+        return None, info
+    step = max(1, len(sel) // max_views)
+    sel = sel[::step][:max_views]
+    views = [View(im, tr.box) for im, _, _ in sel]
+    P0 = np.array([p for _, p, _ in sel])
+    cx, cy = tr._center()
+    s0 = mean_score(views, model, C0, P0, cx, cy)
+    t1 = time.time()
+    # La hauteur est mal contrainte par les lignes seules (une camera plus haute et
+    # plus loin, moins inclinee, dessine presque le meme terrain) : plusieurs
+    # departs en hauteur, on garde l'ajustement qui colle le mieux.
+    best = None
+    for z0 in CAMERA_HEIGHTS:
+        Cz = np.array([C0[0], C0[1], z0])
+        Pz = np.array([local_search(v, model, Cz, P0[k], dp=(2.0, 1.0, 0.08), cx=cx, cy=cy)[0]
+                       for k, v in enumerate(views)])
+        x0 = np.concatenate([Cz, (Pz / np.array([1.0, 1.0, 1000.0])).ravel()])
+        r = least_squares(_joint_residuals, x0, args=(views, model, cx, cy), method='trf',
+                          loss='soft_l1', f_scale=0.3, max_nfev=40, x_scale='jac')
+        if best is None or r.cost < best[0]:
+            best = (r.cost, r.x)
+    C = best[1][:3]
+    P = best[1][3:].reshape(-1, 3) * np.array([1.0, 1.0, 1000.0])
+    s1 = mean_score(views, model, C, P, cx, cy)
+    info.update(views=len(views), fit_s=round(time.time() - t1, 1),
+                score_prior=round(s0, 3), score=round(s1, 3), camera=[round(float(c), 2) for c in C])
+    log("camera estimate: %s score %.3f (prior %.3f) from %d views" % (info["camera"], s1, s0, len(views)))
+    if s1 > CAMERA_MAX_SCORE or not (0 < C[0] < L and W < C[1] < W + 40 and 1.0 < C[2] < 25.0):
+        info["error"] = "camera fit not convincing"
+        return None, info
+    return C, info
