@@ -221,8 +221,12 @@ def iter_frames(cap, start, end, fps_out):
 # (NVDEC) : le decodage CPU d'une video 3440 px etait le poste le plus variable
 # d'une machine RunPod a l'autre (6 a 30 min par match). "auto" essaie le GPU
 # puis ffmpeg CPU puis OpenCV ; "cv2" revient a l'ancienne lecture.
-VIDEO_DECODER = os.environ.get("VIDEO_DECODER", "auto")
-DETECT_WIDTH = int(os.environ.get("DETECT_WIDTH", "1920"))   # largeur des images pour la detection
+# Mesure du 8/10 (job 3028278c, 7 decodages NVDEC en parallele) : pas plus rapide
+# que le CPU (lecture 1 780 s) et les images reduites a 1 920 px degradent la
+# reconnaissance des equipes. Par defaut on garde donc OpenCV ; "auto" reste
+# disponible pour de nouveaux essais.
+VIDEO_DECODER = os.environ.get("VIDEO_DECODER", "cv2")
+DETECT_WIDTH = int(os.environ.get("DETECT_WIDTH", "0"))      # 0 = pleine resolution pour la detection
 _DECODER_OK = {}        # mode -> True/False, appris au premier essai (par processus)
 
 
