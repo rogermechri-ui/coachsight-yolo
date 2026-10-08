@@ -217,6 +217,130 @@ def iter_frames(cap, start, end, fps_out):
         next_t += step
 
 
+# Decodage de la video par ffmpeg, sur la carte graphique quand c'est possible
+# (NVDEC) : le decodage CPU d'une video 3440 px etait le poste le plus variable
+# d'une machine RunPod a l'autre (6 a 30 min par match). "auto" essaie le GPU
+# puis ffmpeg CPU puis OpenCV ; "cv2" revient a l'ancienne lecture.
+VIDEO_DECODER = os.environ.get("VIDEO_DECODER", "auto")
+DETECT_WIDTH = int(os.environ.get("DETECT_WIDTH", "1920"))   # largeur des images pour la detection
+_DECODER_OK = {}        # mode -> True/False, appris au premier essai (par processus)
+
+
+def _video_size(source):
+    """(largeur, hauteur, codec) de la video ; codec = 'h264', 'hevc', ... ou ''."""
+    cap = cv2.VideoCapture(source)
+    try:
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    finally:
+        cap.release()
+    tag = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)).lower()
+    codec = {"avc1": "h264", "h264": "h264", "x264": "h264", "hev1": "hevc", "hvc1": "hevc",
+             "hevc": "hevc", "av01": "av1"}.get(tag.strip("\x00 "), "")
+    return w, h, codec
+
+
+_CUVID = {"h264": "h264_cuvid", "hevc": "hevc_cuvid", "av1": "av1_cuvid"}
+
+
+def _ffmpeg_frames(source, start, end, fps, width, gpu):
+    """Images (t, BGR) de `source` entre start et end a `fps`, reduites a `width`
+    px de large, via ffmpeg (NVDEC + redimensionnement sur la carte si gpu)."""
+    import subprocess
+    w0, h0, codec = _video_size(source)
+    if not w0 or not h0:
+        raise RuntimeError("video size unknown")
+    if width and width < w0:
+        w, h = width, int(round(h0 * width / w0 / 2)) * 2
+    else:
+        w, h = w0, h0
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    vf = ["fps=%g:round=near" % fps]
+    if gpu:
+        # Decodeur NVDEC (cuvid) : il reduit lui-meme l'image (-resize), les images
+        # arrivent en memoire centrale ; aucun filtre CUDA necessaire.
+        if codec not in _CUVID:
+            raise RuntimeError("no NVDEC decoder for codec %r" % codec)
+        cmd += ["-c:v", _CUVID[codec]]
+        if (w, h) != (w0, h0):
+            cmd += ["-resize", "%dx%d" % (w, h)]
+    elif (w, h) != (w0, h0):
+        vf.append("scale=%d:%d" % (w, h))
+    cmd += ["-ss", "%.3f" % start, "-t", "%.3f" % max(0.0, end - start + 0.5 / fps), "-i", source,
+            "-vf", ",".join(vf), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    n_bytes = w * h * 3
+    k = 0
+    try:
+        while True:
+            parts, got = [], 0
+            while got < n_bytes:              # un tube rend parfois moins que demande
+                chunk = p.stdout.read(n_bytes - got)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                got += len(chunk)
+            buf = b"".join(parts)
+            if len(buf) < n_bytes:            # fin de la video (ou erreur ffmpeg)
+                if k == 0:
+                    err = p.stderr.read().decode(errors="replace").strip()
+                    raise RuntimeError("ffmpeg produced no frame: " + err[-300:])
+                break
+            t = start + k / fps
+            if t > end + 1e-6:
+                break
+            yield t, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            k += 1
+    finally:
+        # Arret avant la fin : ffmpeg peut etre bloque en ecriture ; on le tue
+        # avant de fermer les tubes (sinon interblocage).
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.stdout.close()
+            p.stderr.close()
+        except Exception:
+            pass
+
+
+def read_frames(source, start, end, fps, width=None):
+    """Images (t, BGR) toutes les 1/fps s entre start et end : ffmpeg sur la carte
+    graphique, sinon ffmpeg CPU, sinon OpenCV (ancienne lecture). Le premier mode
+    qui marche est garde pour la suite du processus."""
+    modes = {"auto": ["gpu", "cpu", "cv2"], "gpu": ["gpu", "cv2"], "cpu": ["cpu", "cv2"], "cv2": ["cv2"]}
+    for mode in modes.get(VIDEO_DECODER, modes["auto"]):
+        if _DECODER_OK.get(mode) is False:
+            continue
+        if mode == "cv2":
+            cap = cv2.VideoCapture(source)
+            try:
+                for t, frame in iter_frames(cap, start, end, fps):
+                    if width and frame.shape[1] > width:
+                        frame = cv2.resize(frame, (width, int(frame.shape[0] * width / frame.shape[1])),
+                                           interpolation=cv2.INTER_AREA)
+                    yield t, frame
+            finally:
+                cap.release()
+            return
+        gen = _ffmpeg_frames(source, start, end, fps, width, gpu=(mode == "gpu"))
+        try:
+            first = next(gen)
+        except Exception as e:
+            if _DECODER_OK.get(mode) is None:
+                print("video decoder %s unavailable: %s" % (mode, str(e)[:200]), flush=True)
+            _DECODER_OK[mode] = False
+            continue
+        if _DECODER_OK.get(mode) is None:
+            print("video decoder: %s" % mode, flush=True)
+        _DECODER_OK[mode] = True
+        _DECODER_OK["used"] = mode
+        yield first
+        yield from gen
+        return
+
+
 def _grab_jpegs(source, times, width, quality):
     """Lit les images aux instants `times` (fichier local) et les compresse en
     JPEG. Chaque appel a sa propre lecture video : plusieurs appels peuvent
@@ -343,14 +467,13 @@ def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
     H, size, err, n_full = {}, None, None, 0
     t0 = time.time()
     try:
-        cap = cv2.VideoCapture(source)
         last_w = None
         for ws, we, wid, a, b in slices:
             if last_w is not None and wid != last_w:      # nouvelle periode : la camera a pu bouger
                 tracker.p = None
                 tracker.feat = None
             last_w = wid
-            for j, (t, frame) in enumerate(iter_frames(cap, ws, we, fps_out * k)):
+            for j, (t, frame) in enumerate(read_frames(source, ws, we, fps_out * k, width=pitch_track.WORK_W)):
                 img = pitch_track.to_work(frame)
                 size = (img.shape[1], img.shape[0])
                 if j % k:
@@ -364,7 +487,6 @@ def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
                 n_full += 1
                 if a - 1e-6 <= t <= b + 1e-6:      # les secondes d'avant ne servent qu'a demarrer
                     H[round(t, 2)] = (None if h is None else h.tolist(), s)
-        cap.release()
     except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
         err = "%s: %s" % (type(e).__name__, str(e)[:200])
     st = dict(tracker.stats)
@@ -442,7 +564,7 @@ class PitchWorker:
         return self.H
 
 
-def track(cap, windows, fps_out, timings):
+def track(source, windows, fps_out, timings):
     """Detection + suivi des joueurs et du ballon dans chaque periode de jeu.
     Les positions sont gardees en coordonnees d'image normalisees (0..1) :
     la conversion en metres se fait ensuite (calage du terrain si fourni).
@@ -456,7 +578,7 @@ def track(cap, windows, fps_out, timings):
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
     for ws, we in windows:
         clock = time.time()
-        for t, frame in iter_frames(cap, ws, we, fps_out):
+        for t, frame in read_frames(source, ws, we, fps_out, width=DETECT_WIDTH):
             t_read += time.time() - clock
             h, w = frame.shape[:2]
             c = time.time()
@@ -548,19 +670,15 @@ def camera_frames(source, windows, n=CAMERA_SEGMENTS, dur=CAMERA_SEGMENT_S, fps=
     if total <= 0:
         return
     marks = [total * (k + 0.5) / n for k in range(n)]
-    cap = cv2.VideoCapture(source)
-    try:
-        for m in marks:
-            acc = 0.0
-            for ws, we in windows:
-                if acc + (we - ws) > m:
-                    a = min(ws + (m - acc), max(ws, we - dur))
-                    for _, frame in iter_frames(cap, a, min(we, a + dur), fps):
-                        yield frame
-                    break
-                acc += we - ws
-    finally:
-        cap.release()
+    for m in marks:
+        acc = 0.0
+        for ws, we in windows:
+            if acc + (we - ws) > m:
+                a = min(ws + (m - acc), max(ws, we - dur))
+                for _, frame in read_frames(source, a, min(we, a + dur), fps, width=pitch_track.WORK_W):
+                    yield frame
+                break
+            acc += we - ws
 
 
 def estimate_camera(source, windows, L, W):
@@ -848,7 +966,7 @@ def process(inp):
         timings["camera_s"] = round(time.time() - clock, 1)
     clock = time.time()
     worker = PitchWorker(camera, L, W, windows, tmp or url, fps_out) if camera is not None else None
-    raw, votes = track(cap, windows, fps_out, timings)
+    raw, votes = track(tmp or url, windows, fps_out, timings)
     expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
@@ -861,8 +979,9 @@ def process(inp):
         if worker:
             worker.finish()
             worker = PitchWorker(camera, L, W, windows, tmp, fps_out)
-        raw, votes = track(cap, windows, fps_out, timings)
+        raw, votes = track(tmp or url, windows, fps_out, timings)
     timings["tracking_s"] = round(time.time() - clock, 1)
+    timings["video_decoder"] = _DECODER_OK.get("used", "cv2")
     per_frame_H, pitch_info = {}, None
     if worker:
         c = time.time()
