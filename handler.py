@@ -1353,18 +1353,33 @@ PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
 FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg")
 
 
-def _ffmpeg_encode(src, dst, width, fps, encoder):
-    """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son)."""
+PROXY_CQ = int(os.environ.get("PROXY_CQ", "22"))   # qualite NVENC (plus petit = meilleur) ; 28 effacait les lignes lointaines
+
+
+def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
+    """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son).
+    Avec gpu_decode, la video source est decodee par la puce video (NVDEC) : un
+    seul flux, c'est la ou le decodage GPU fait gagner du temps (le decodage CPU
+    de la video 3440 px prenait 30 a 40 min sur les machines a peu de coeurs)."""
     import subprocess
-    vf = "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
+    pre = []
+    if encoder == "h264_nvenc" and gpu_decode:
+        w0, h0, codec_in = _video_size(src)
+        if codec_in in _CUVID and w0:
+            w = min(width, w0)
+            h = int(round(h0 * w / w0 / 2)) * 2
+            pre = ["-c:v", _CUVID[codec_in], "-resize", "%dx%d" % (w, h)]
+    vf = "fps=%d" % fps if pre else "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
     if encoder == "h264_nvenc":
-        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28", "-b:v", "0"]
+        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
     else:
-        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]
-    cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", src, "-vf", vf, "-an",
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cq)]
+    cmd = [FFMPEG, "-y", "-loglevel", "error", *pre, "-i", src, "-vf", vf, "-an",
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
+        if pre:     # le decodage GPU a echoue (carte, codec) : on reessaie sur le processeur
+            return _ffmpeg_encode(src, dst, width, fps, encoder, cq, gpu_decode=False)
         raise RuntimeError("%s: %s" % (encoder, r.stderr.strip()[-300:]))
 
 
@@ -1383,12 +1398,13 @@ def prepare(inp):
     cap.release()
     width = int(inp.get("proxy_width", PROXY_WIDTH))
     fps = int(inp.get("proxy_fps", PROXY_FPS))
+    cq = int(inp.get("proxy_cq", PROXY_CQ))
     dst = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     clock = time.time()
     encoder, errors = None, []
     for enc in ("h264_nvenc", "libx264"):   # puce video du GPU d'abord, sinon processeur
         try:
-            _ffmpeg_encode(src, dst, width, fps, enc)
+            _ffmpeg_encode(src, dst, width, fps, enc, cq)
             encoder = enc
             break
         except Exception as e:
@@ -1411,7 +1427,7 @@ def prepare(inp):
     os.remove(dst)
     timings["total_s"] = round(time.time() - job_clock, 1)
     return {"task": "prepare", "encoder": encoder, "original": {"width": w, "height": h, "bytes": size_in},
-            "proxy": {"width": pw, "height": ph, "fps": fps, "bytes": size_out},
+            "proxy": {"width": pw, "height": ph, "fps": fps, "cq": cq, "bytes": size_out},
             "duration_s": round(duration, 2) if duration else None, "timings": timings}
 
 
@@ -1448,8 +1464,13 @@ def handler(job):
     inp = job["input"]
     if not inp.get("callback_url"):
         # Test direct (console RunPod) : pas d'application a prevenir, on renvoie un resume.
+        if inp.get("task") == "prepare":
+            try:
+                return {"status": "proxy_ready", "result": prepare(inp)}
+            except Exception as e:
+                return {"status": "proxy_failed", "error": str(e)[:900]}
         if inp.get("task"):
-            return {"status": "failed", "error": "direct test supports the default analysis only"}
+            return {"status": "failed", "error": "direct test supports the default analysis and prepare only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
