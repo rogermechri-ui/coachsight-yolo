@@ -1107,7 +1107,10 @@ def process(inp):
             if not ball and tid >= 0 and tid not in seen:
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
-        frames.append({"t": tt, "points": out, "calibrated": bool(cal), "view": view_of(i)})
+        # Calage degenere (tous les joueurs projetes au meme endroit) : image
+        # marquee non calee, pour le site comme pour les mesures tactiques.
+        ok = bool(cal) and positions_plausible([(p["x"], p["y"]) for p in out if not p["ball"]])
+        frames.append({"t": tt, "points": out, "calibrated": ok, "view": view_of(i) if ok else None})
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
