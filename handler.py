@@ -796,6 +796,19 @@ def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
 
 KEEPER_GAP_M = 8.0
 SIDE_SWITCH_MIN_S = 50 * 60     # une periode plus longue contient sans doute les deux mi-temps
+MIN_SPREAD_M = 6.0              # six joueurs ou plus tiennent toujours dans plus de 6 m x 6 m
+
+
+def positions_plausible(pts):
+    """Faux quand le calage de l'image est degenere : au moins six joueurs
+    projetes dans un carre de MIN_SPREAD_M de cote (tous au meme endroit).
+    Observe sur l'original 3440 px : des tranches entieres avec 10 a 18 joueurs
+    a x = 53 m, qui tiraient la ligne defensive vers le milieu du terrain."""
+    if len(pts) < 6:
+        return True
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return max(xs) - min(xs) >= MIN_SPREAD_M or max(ys) - min(ys) >= MIN_SPREAD_M
 
 
 def split_at_side_switch(frames, windows):
@@ -852,6 +865,8 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
         per_team = {0: [], 1: []}
         votes = []          # par image ou les deux equipes sont visibles : equipe 0 a gauche ?
         for f in fr:
+            if not positions_plausible([(p["x"], p["y"]) for p in f["points"] if not p["ball"]]):
+                continue        # calage degenere : tous les joueurs au meme endroit
             xs = {team: [(p["x"], p["y"]) for p in f["points"] if not p["ball"] and p["team"] == team] for team in (0, 1)}
             for team in (0, 1):
                 if len(xs[team]) >= min_players:
@@ -1498,18 +1513,19 @@ def summarize(result):
     for f in result.get("frames", []):
         if not f.get("calibrated"):
             continue
+        collapsed = not positions_plausible([(p["x"], p["y"]) for p in f["points"] if not p["ball"]])
         for tm in (0, 1):
             xs = sorted(p["x"] for p in f["points"] if not p["ball"] and p["team"] == tm)
             if len(xs) < 6:
                 continue
             lo = xs[1:] if xs[1] - xs[0] >= KEEPER_GAP_M else xs
             hi = xs[:-1] if xs[-1] - xs[-2] >= KEEPER_GAP_M else xs
-            pos.setdefault((int(f["t"] // 300) * 5, tm), []).append((len(xs), np.mean(lo[:3]), np.mean(hi[-3:]), np.mean(xs)))
+            pos.setdefault((int(f["t"] // 300) * 5, tm), []).append((len(xs), np.mean(lo[:3]), np.mean(hi[-3:]), np.mean(xs), collapsed))
     positions = {}
     for (k, tm), v in sorted(pos.items()):
         a = np.array(v)
         positions.setdefault("%d min" % k, {})["team%d" % tm] = {
-            "frames": len(v), "players": float(np.median(a[:, 0])),
+            "frames": len(v), "collapsed": int(a[:, 4].sum()), "players": float(np.median(a[:, 0])),
             "left3_x": round(float(np.median(a[:, 1])), 1), "right3_x": round(float(np.median(a[:, 2])), 1),
             "mean_x": round(float(np.median(a[:, 3])), 1)}
     return {"team0_left_by_5min": timeline, "positions_by_5min": positions,
