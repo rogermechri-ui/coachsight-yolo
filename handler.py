@@ -1374,13 +1374,17 @@ def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
         codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
     else:
         codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cq)]
-    cmd = [FFMPEG, "-y", "-loglevel", "error", *pre, "-i", src, "-vf", vf, "-an",
+    net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"] if src.startswith("http") else []
+    cmd = [FFMPEG, "-y", "-loglevel", "error", *net, *pre, "-i", src, "-vf", vf, "-an",
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
+        err = r.stderr.strip()[-300:]
+        if "No space left" in err:
+            raise RuntimeError("%s: %s" % (encoder, err))     # inutile de reessayer autrement
         if pre:     # le decodage GPU a echoue (carte, codec) : on reessaie sur le processeur
             return _ffmpeg_encode(src, dst, width, fps, encoder, cq, gpu_decode=False)
-        raise RuntimeError("%s: %s" % (encoder, r.stderr.strip()[-300:]))
+        raise RuntimeError("%s: %s" % (encoder, err))
 
 
 def prepare(inp):
@@ -1390,8 +1394,12 @@ def prepare(inp):
     copie : telechargement, lecture et extraction bien plus rapides."""
     timings = {}
     clock = job_clock = time.time()
-    src = download(inp["video_url"])
-    timings["download_s"] = round(time.time() - clock, 1)
+    # La video source est lue directement a son adresse (pas de copie locale) :
+    # le disque d'un moteur RunPod (5 Go) ne tient pas l'original + la copie.
+    src = inp["video_url"]
+    if not src.startswith("http") or inp.get("proxy_download_source"):
+        src = download(src)
+        timings["download_s"] = round(time.time() - clock, 1)
     cap = cv2.VideoCapture(src)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = video_end(cap)
@@ -1409,15 +1417,28 @@ def prepare(inp):
             break
         except Exception as e:
             errors.append(str(e)[:200])
+            if "No space left" in str(e):
+                break
     timings["encode_s"] = round(time.time() - clock, 1)
+    local_src = not src.startswith("http")
     if encoder is None:
-        os.remove(src)
+        if local_src:
+            os.remove(src)
+        if os.path.exists(dst):
+            os.remove(dst)
         raise RuntimeError("proxy encoding failed: " + " | ".join(errors))
     cap = cv2.VideoCapture(dst)
     pw, ph = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-    size_in, size_out = os.path.getsize(src), os.path.getsize(dst)
-    os.remove(src)
+    size_out = os.path.getsize(dst)
+    if local_src:
+        size_in = os.path.getsize(src)
+        os.remove(src)
+    else:
+        try:
+            size_in = int(requests.head(src, timeout=60, allow_redirects=True).headers.get("Content-Length", 0))
+        except Exception:
+            size_in = None
     clock = time.time()
     with open(dst, "rb") as f:
         r = requests.put(inp["proxy_upload_url"], data=f, timeout=1800,
