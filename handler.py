@@ -1490,7 +1490,30 @@ def summarize(result):
         if f.get("calibrated") and len(xs[0]) >= 4 and len(xs[1]) >= 4:
             side.setdefault(int(f["t"] // 300) * 5, []).append(np.mean(xs[0]) < np.mean(xs[1]))
     timeline = {"%d min" % k: "%d%% (%d)" % (round(100 * np.mean(v)), len(v)) for k, v in sorted(side.items())}
-    return {"team0_left_by_5min": timeline,"timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
+    # Diagnostic par tranche de 5 min et par equipe : images avec >= 6 joueurs,
+    # nombre median de joueurs, x median des 3 joueurs les plus a gauche / a
+    # droite (gardien exclu) et x median du bloc. Sert a comparer deux analyses
+    # (original / copie allegee) quand un indicateur tactique differe.
+    pos = {}
+    for f in result.get("frames", []):
+        if not f.get("calibrated"):
+            continue
+        for tm in (0, 1):
+            xs = sorted(p["x"] for p in f["points"] if not p["ball"] and p["team"] == tm)
+            if len(xs) < 6:
+                continue
+            lo = xs[1:] if xs[1] - xs[0] >= KEEPER_GAP_M else xs
+            hi = xs[:-1] if xs[-1] - xs[-2] >= KEEPER_GAP_M else xs
+            pos.setdefault((int(f["t"] // 300) * 5, tm), []).append((len(xs), np.mean(lo[:3]), np.mean(hi[-3:]), np.mean(xs)))
+    positions = {}
+    for (k, tm), v in sorted(pos.items()):
+        a = np.array(v)
+        positions.setdefault("%d min" % k, {})["team%d" % tm] = {
+            "frames": len(v), "players": float(np.median(a[:, 0])),
+            "left3_x": round(float(np.median(a[:, 1])), 1), "right3_x": round(float(np.median(a[:, 2])), 1),
+            "mean_x": round(float(np.median(a[:, 3])), 1)}
+    return {"team0_left_by_5min": timeline, "positions_by_5min": positions,
+            "timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
             "tactical": result.get("tactical"), "total_frames": result.get("total_frames"),
             "tracks": len(result.get("tracks", [])), "ball_frames": result.get("ball_frames"),
             "players_per_frame_median": float(np.median([len(f["points"]) for f in result.get("frames", [])] or [0]))}
