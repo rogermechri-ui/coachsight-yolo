@@ -1356,6 +1356,20 @@ FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/
 PROXY_CQ = int(os.environ.get("PROXY_CQ", "22"))   # qualite NVENC (plus petit = meilleur) ; 28 effacait les lignes lointaines
 
 
+def _ffprobe_size(src):
+    """(largeur, hauteur, duree) par ffprobe, pour une source que OpenCV n'ouvre pas."""
+    import subprocess, json as _json
+    try:
+        r = subprocess.run([FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height:format=duration", "-of", "json", src],
+                           capture_output=True, text=True, timeout=120)
+        d = _json.loads(r.stdout or "{}")
+        st = (d.get("streams") or [{}])[0]
+        return int(st.get("width") or 0), int(st.get("height") or 0), float((d.get("format") or {}).get("duration") or 0) or None
+    except Exception:
+        return 0, 0, None
+
+
 def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
     """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son).
     Avec gpu_decode, la video source est decodee par la puce video (NVDEC) : un
@@ -1364,12 +1378,11 @@ def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
     import subprocess
     pre = []
     if encoder == "h264_nvenc" and gpu_decode:
-        w0, h0, codec_in = _video_size(src)
-        if codec_in in _CUVID and w0:
-            w = min(width, w0)
-            h = int(round(h0 * w / w0 / 2)) * 2
-            pre = ["-c:v", _CUVID[codec_in], "-resize", "%dx%d" % (w, h)]
-    vf = "fps=%d" % fps if pre else "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
+        # Decodage NVDEC generique (-hwaccel cuda) : marche aussi quand la source est
+        # lue a distance et que ses dimensions ne sont pas connues d'avance ; le
+        # redimensionnement se fait ensuite sur le processeur (bon marche).
+        pre = ["-hwaccel", "cuda"]
+    vf = "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
     if encoder == "h264_nvenc":
         codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
     else:
@@ -1404,6 +1417,8 @@ def prepare(inp):
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = video_end(cap)
     cap.release()
+    if w <= 0:
+        w, h, duration = _ffprobe_size(src)
     width = int(inp.get("proxy_width", PROXY_WIDTH))
     fps = int(inp.get("proxy_fps", PROXY_FPS))
     cq = int(inp.get("proxy_cq", PROXY_CQ))
