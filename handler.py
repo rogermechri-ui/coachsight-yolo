@@ -217,6 +217,134 @@ def iter_frames(cap, start, end, fps_out):
         next_t += step
 
 
+# Decodage de la video par ffmpeg, sur la carte graphique quand c'est possible
+# (NVDEC) : le decodage CPU d'une video 3440 px etait le poste le plus variable
+# d'une machine RunPod a l'autre (6 a 30 min par match). "auto" essaie le GPU
+# puis ffmpeg CPU puis OpenCV ; "cv2" revient a l'ancienne lecture.
+# Mesure du 8/10 (job 3028278c, 7 decodages NVDEC en parallele) : pas plus rapide
+# que le CPU (lecture 1 780 s) et les images reduites a 1 920 px degradent la
+# reconnaissance des equipes. Par defaut on garde donc OpenCV ; "auto" reste
+# disponible pour de nouveaux essais.
+VIDEO_DECODER = os.environ.get("VIDEO_DECODER", "cv2")
+DETECT_WIDTH = int(os.environ.get("DETECT_WIDTH", "0"))      # 0 = pleine resolution pour la detection
+_DECODER_OK = {}        # mode -> True/False, appris au premier essai (par processus)
+
+
+def _video_size(source):
+    """(largeur, hauteur, codec) de la video ; codec = 'h264', 'hevc', ... ou ''."""
+    cap = cv2.VideoCapture(source)
+    try:
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    finally:
+        cap.release()
+    tag = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)).lower()
+    codec = {"avc1": "h264", "h264": "h264", "x264": "h264", "hev1": "hevc", "hvc1": "hevc",
+             "hevc": "hevc", "av01": "av1"}.get(tag.strip("\x00 "), "")
+    return w, h, codec
+
+
+_CUVID = {"h264": "h264_cuvid", "hevc": "hevc_cuvid", "av1": "av1_cuvid"}
+
+
+def _ffmpeg_frames(source, start, end, fps, width, gpu):
+    """Images (t, BGR) de `source` entre start et end a `fps`, reduites a `width`
+    px de large, via ffmpeg (NVDEC + redimensionnement sur la carte si gpu)."""
+    import subprocess
+    w0, h0, codec = _video_size(source)
+    if not w0 or not h0:
+        raise RuntimeError("video size unknown")
+    if width and width < w0:
+        w, h = width, int(round(h0 * width / w0 / 2)) * 2
+    else:
+        w, h = w0, h0
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    vf = ["fps=%g:round=near" % fps]
+    if gpu:
+        # Decodeur NVDEC (cuvid) : il reduit lui-meme l'image (-resize), les images
+        # arrivent en memoire centrale ; aucun filtre CUDA necessaire.
+        if codec not in _CUVID:
+            raise RuntimeError("no NVDEC decoder for codec %r" % codec)
+        cmd += ["-c:v", _CUVID[codec]]
+        if (w, h) != (w0, h0):
+            cmd += ["-resize", "%dx%d" % (w, h)]
+    elif (w, h) != (w0, h0):
+        vf.append("scale=%d:%d" % (w, h))
+    cmd += ["-ss", "%.3f" % start, "-t", "%.3f" % max(0.0, end - start + 0.5 / fps), "-i", source,
+            "-vf", ",".join(vf), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    n_bytes = w * h * 3
+    k = 0
+    try:
+        while True:
+            parts, got = [], 0
+            while got < n_bytes:              # un tube rend parfois moins que demande
+                chunk = p.stdout.read(n_bytes - got)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                got += len(chunk)
+            buf = b"".join(parts)
+            if len(buf) < n_bytes:            # fin de la video (ou erreur ffmpeg)
+                if k == 0:
+                    err = p.stderr.read().decode(errors="replace").strip()
+                    raise RuntimeError("ffmpeg produced no frame: " + err[-300:])
+                break
+            t = start + k / fps
+            if t > end + 1e-6:
+                break
+            yield t, np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            k += 1
+    finally:
+        # Arret avant la fin : ffmpeg peut etre bloque en ecriture ; on le tue
+        # avant de fermer les tubes (sinon interblocage).
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.stdout.close()
+            p.stderr.close()
+        except Exception:
+            pass
+
+
+def read_frames(source, start, end, fps, width=None):
+    """Images (t, BGR) toutes les 1/fps s entre start et end : ffmpeg sur la carte
+    graphique, sinon ffmpeg CPU, sinon OpenCV (ancienne lecture). Le premier mode
+    qui marche est garde pour la suite du processus."""
+    modes = {"auto": ["gpu", "cpu", "cv2"], "gpu": ["gpu", "cv2"], "cpu": ["cpu", "cv2"], "cv2": ["cv2"]}
+    for mode in modes.get(VIDEO_DECODER, modes["auto"]):
+        if _DECODER_OK.get(mode) is False:
+            continue
+        if mode == "cv2":
+            cap = cv2.VideoCapture(source)
+            try:
+                for t, frame in iter_frames(cap, start, end, fps):
+                    if width and frame.shape[1] > width:
+                        frame = cv2.resize(frame, (width, int(frame.shape[0] * width / frame.shape[1])),
+                                           interpolation=cv2.INTER_AREA)
+                    yield t, frame
+            finally:
+                cap.release()
+            return
+        gen = _ffmpeg_frames(source, start, end, fps, width, gpu=(mode == "gpu"))
+        try:
+            first = next(gen)
+        except Exception as e:
+            if _DECODER_OK.get(mode) is None:
+                print("video decoder %s unavailable: %s" % (mode, str(e)[:200]), flush=True)
+            _DECODER_OK[mode] = False
+            continue
+        if _DECODER_OK.get(mode) is None:
+            print("video decoder: %s" % mode, flush=True)
+        _DECODER_OK[mode] = True
+        _DECODER_OK["used"] = mode
+        yield first
+        yield from gen
+        return
+
+
 def _grab_jpegs(source, times, width, quality):
     """Lit les images aux instants `times` (fichier local) et les compresse en
     JPEG. Chaque appel a sa propre lecture video : plusieurs appels peuvent
@@ -343,14 +471,13 @@ def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
     H, size, err, n_full = {}, None, None, 0
     t0 = time.time()
     try:
-        cap = cv2.VideoCapture(source)
         last_w = None
         for ws, we, wid, a, b in slices:
             if last_w is not None and wid != last_w:      # nouvelle periode : la camera a pu bouger
                 tracker.p = None
                 tracker.feat = None
             last_w = wid
-            for j, (t, frame) in enumerate(iter_frames(cap, ws, we, fps_out * k)):
+            for j, (t, frame) in enumerate(read_frames(source, ws, we, fps_out * k, width=pitch_track.WORK_W)):
                 img = pitch_track.to_work(frame)
                 size = (img.shape[1], img.shape[0])
                 if j % k:
@@ -364,7 +491,6 @@ def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
                 n_full += 1
                 if a - 1e-6 <= t <= b + 1e-6:      # les secondes d'avant ne servent qu'a demarrer
                     H[round(t, 2)] = (None if h is None else h.tolist(), s)
-        cap.release()
     except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
         err = "%s: %s" % (type(e).__name__, str(e)[:200])
     st = dict(tracker.stats)
@@ -442,7 +568,7 @@ class PitchWorker:
         return self.H
 
 
-def track(cap, windows, fps_out, timings):
+def track(source, windows, fps_out, timings):
     """Detection + suivi des joueurs et du ballon dans chaque periode de jeu.
     Les positions sont gardees en coordonnees d'image normalisees (0..1) :
     la conversion en metres se fait ensuite (calage du terrain si fourni).
@@ -456,7 +582,7 @@ def track(cap, windows, fps_out, timings):
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
     for ws, we in windows:
         clock = time.time()
-        for t, frame in iter_frames(cap, ws, we, fps_out):
+        for t, frame in read_frames(source, ws, we, fps_out, width=DETECT_WIDTH):
             t_read += time.time() - clock
             h, w = frame.shape[:2]
             c = time.time()
@@ -548,19 +674,15 @@ def camera_frames(source, windows, n=CAMERA_SEGMENTS, dur=CAMERA_SEGMENT_S, fps=
     if total <= 0:
         return
     marks = [total * (k + 0.5) / n for k in range(n)]
-    cap = cv2.VideoCapture(source)
-    try:
-        for m in marks:
-            acc = 0.0
-            for ws, we in windows:
-                if acc + (we - ws) > m:
-                    a = min(ws + (m - acc), max(ws, we - dur))
-                    for _, frame in iter_frames(cap, a, min(we, a + dur), fps):
-                        yield frame
-                    break
-                acc += we - ws
-    finally:
-        cap.release()
+    for m in marks:
+        acc = 0.0
+        for ws, we in windows:
+            if acc + (we - ws) > m:
+                a = min(ws + (m - acc), max(ws, we - dur))
+                for _, frame in read_frames(source, a, min(we, a + dur), fps, width=pitch_track.WORK_W):
+                    yield frame
+                break
+            acc += we - ws
 
 
 def estimate_camera(source, windows, L, W):
@@ -674,6 +796,19 @@ def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
 
 KEEPER_GAP_M = 8.0
 SIDE_SWITCH_MIN_S = 50 * 60     # une periode plus longue contient sans doute les deux mi-temps
+MIN_SPREAD_M = 6.0              # six joueurs ou plus tiennent toujours dans plus de 6 m x 6 m
+
+
+def positions_plausible(pts):
+    """Faux quand le calage de l'image est degenere : au moins six joueurs
+    projetes dans un carre de MIN_SPREAD_M de cote (tous au meme endroit).
+    Observe sur l'original 3440 px : des tranches entieres avec 10 a 18 joueurs
+    a x = 53 m, qui tiraient la ligne defensive vers le milieu du terrain."""
+    if len(pts) < 6:
+        return True
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return max(xs) - min(xs) >= MIN_SPREAD_M or max(ys) - min(ys) >= MIN_SPREAD_M
 
 
 def split_at_side_switch(frames, windows):
@@ -730,6 +865,8 @@ def tactical_metrics(frames, windows, L, W, min_players=6):
         per_team = {0: [], 1: []}
         votes = []          # par image ou les deux equipes sont visibles : equipe 0 a gauche ?
         for f in fr:
+            if not positions_plausible([(p["x"], p["y"]) for p in f["points"] if not p["ball"]]):
+                continue        # calage degenere : tous les joueurs au meme endroit
             xs = {team: [(p["x"], p["y"]) for p in f["points"] if not p["ball"] and p["team"] == team] for team in (0, 1)}
             for team in (0, 1):
                 if len(xs[team]) >= min_players:
@@ -848,7 +985,7 @@ def process(inp):
         timings["camera_s"] = round(time.time() - clock, 1)
     clock = time.time()
     worker = PitchWorker(camera, L, W, windows, tmp or url, fps_out) if camera is not None else None
-    raw, votes = track(cap, windows, fps_out, timings)
+    raw, votes = track(tmp or url, windows, fps_out, timings)
     expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
@@ -861,8 +998,9 @@ def process(inp):
         if worker:
             worker.finish()
             worker = PitchWorker(camera, L, W, windows, tmp, fps_out)
-        raw, votes = track(cap, windows, fps_out, timings)
+        raw, votes = track(tmp or url, windows, fps_out, timings)
     timings["tracking_s"] = round(time.time() - clock, 1)
+    timings["video_decoder"] = _DECODER_OK.get("used", "cv2")
     per_frame_H, pitch_info = {}, None
     if worker:
         c = time.time()
@@ -933,10 +1071,29 @@ def process(inp):
             if not ball and tid >= 0 and col is not None:
                 team_votes.setdefault(tid, Counter())[color_team(col)] += 1
     track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
+    # Vue de chaque image pour les dessins tactiques cote site : homographie
+    # terrain (metres) -> image (0..1), 9 nombres, H[2][2] = 1 ; None sans calage.
+    def view_of(i):
+        Hv = per_frame_H.get(i, (None, None))[0] if per_frame_H else None
+        if Hv is not None:
+            w, h = worker.size
+            Hv = np.diag([1.0 / w, 1.0 / h, 1.0]) @ np.asarray(Hv, dtype=float)
+        elif H is not None:
+            try:
+                Hv = np.linalg.inv(H)
+            except np.linalg.LinAlgError:
+                return None
+        else:
+            return None
+        if not np.all(np.isfinite(Hv)) or abs(Hv[2, 2]) < 1e-12:
+            return None
+        Hv = Hv / Hv[2, 2]
+        return [float("%.6g" % v) for v in Hv.ravel()]
+
     tracks = []
     seen = {}
     frames = []
-    for (tt, pts), cal in zip(placed, cal_flags):
+    for i, ((tt, pts), cal) in enumerate(zip(placed, cal_flags)):
         out = []
         for tid, x, y, ball, col in pts:
             team = track_team.get(tid) if tid >= 0 else color_team(col)
@@ -950,7 +1107,10 @@ def process(inp):
             if not ball and tid >= 0 and tid not in seen:
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
-        frames.append({"t": tt, "points": out, "calibrated": bool(cal)})
+        # Calage degenere (tous les joueurs projetes au meme endroit) : image
+        # marquee non calee, pour le site comme pour les mesures tactiques.
+        ok = bool(cal) and positions_plausible([(p["x"], p["y"]) for p in out if not p["ball"]])
+        frames.append({"t": tt, "points": out, "calibrated": ok, "view": view_of(i) if ok else None})
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
@@ -1211,19 +1371,51 @@ PROXY_FPS = int(os.environ.get("PROXY_FPS", "15"))
 FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg")
 
 
-def _ffmpeg_encode(src, dst, width, fps, encoder):
-    """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son)."""
+PROXY_CQ = int(os.environ.get("PROXY_CQ", "22"))   # qualite NVENC (plus petit = meilleur) ; 28 effacait les lignes lointaines
+
+
+def _ffprobe_size(src):
+    """(largeur, hauteur, duree) par ffprobe, pour une source que OpenCV n'ouvre pas."""
+    import subprocess, json as _json
+    try:
+        r = subprocess.run([FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height:format=duration", "-of", "json", src],
+                           capture_output=True, text=True, timeout=120)
+        d = _json.loads(r.stdout or "{}")
+        st = (d.get("streams") or [{}])[0]
+        return int(st.get("width") or 0), int(st.get("height") or 0), float((d.get("format") or {}).get("duration") or 0) or None
+    except Exception:
+        return 0, 0, None
+
+
+def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
+    """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son).
+    Avec gpu_decode, la video source est decodee par la puce video (NVDEC) : un
+    seul flux, c'est la ou le decodage GPU fait gagner du temps (le decodage CPU
+    de la video 3440 px prenait 30 a 40 min sur les machines a peu de coeurs)."""
     import subprocess
+    pre = []
+    if encoder == "h264_nvenc" and gpu_decode:
+        # Decodage NVDEC generique (-hwaccel cuda) : marche aussi quand la source est
+        # lue a distance et que ses dimensions ne sont pas connues d'avance ; le
+        # redimensionnement se fait ensuite sur le processeur (bon marche).
+        pre = ["-hwaccel", "cuda"]
     vf = "scale='min(%d,iw)':-2,fps=%d" % (width, fps)
     if encoder == "h264_nvenc":
-        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "28", "-b:v", "0"]
+        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", str(cq), "-b:v", "0"]
     else:
-        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]
-    cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", src, "-vf", vf, "-an",
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cq)]
+    net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"] if src.startswith("http") else []
+    cmd = [FFMPEG, "-y", "-loglevel", "error", *net, *pre, "-i", src, "-vf", vf, "-an",
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError("%s: %s" % (encoder, r.stderr.strip()[-300:]))
+        err = r.stderr.strip()[-300:]
+        if "No space left" in err:
+            raise RuntimeError("%s: %s" % (encoder, err))     # inutile de reessayer autrement
+        if pre:     # le decodage GPU a echoue (carte, codec) : on reessaie sur le processeur
+            return _ffmpeg_encode(src, dst, width, fps, encoder, cq, gpu_decode=False)
+        raise RuntimeError("%s: %s" % (encoder, err))
 
 
 def prepare(inp):
@@ -1233,33 +1425,53 @@ def prepare(inp):
     copie : telechargement, lecture et extraction bien plus rapides."""
     timings = {}
     clock = job_clock = time.time()
-    src = download(inp["video_url"])
-    timings["download_s"] = round(time.time() - clock, 1)
+    # La video source est lue directement a son adresse (pas de copie locale) :
+    # le disque d'un moteur RunPod (5 Go) ne tient pas l'original + la copie.
+    src = inp["video_url"]
+    if not src.startswith("http") or inp.get("proxy_download_source"):
+        src = download(src)
+        timings["download_s"] = round(time.time() - clock, 1)
     cap = cv2.VideoCapture(src)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = video_end(cap)
     cap.release()
+    if w <= 0:
+        w, h, duration = _ffprobe_size(src)
     width = int(inp.get("proxy_width", PROXY_WIDTH))
     fps = int(inp.get("proxy_fps", PROXY_FPS))
+    cq = int(inp.get("proxy_cq", PROXY_CQ))
     dst = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     clock = time.time()
     encoder, errors = None, []
     for enc in ("h264_nvenc", "libx264"):   # puce video du GPU d'abord, sinon processeur
         try:
-            _ffmpeg_encode(src, dst, width, fps, enc)
+            _ffmpeg_encode(src, dst, width, fps, enc, cq)
             encoder = enc
             break
         except Exception as e:
             errors.append(str(e)[:200])
+            if "No space left" in str(e):
+                break
     timings["encode_s"] = round(time.time() - clock, 1)
+    local_src = not src.startswith("http")
     if encoder is None:
-        os.remove(src)
+        if local_src:
+            os.remove(src)
+        if os.path.exists(dst):
+            os.remove(dst)
         raise RuntimeError("proxy encoding failed: " + " | ".join(errors))
     cap = cv2.VideoCapture(dst)
     pw, ph = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-    size_in, size_out = os.path.getsize(src), os.path.getsize(dst)
-    os.remove(src)
+    size_out = os.path.getsize(dst)
+    if local_src:
+        size_in = os.path.getsize(src)
+        os.remove(src)
+    else:
+        try:
+            size_in = int(requests.head(src, timeout=60, allow_redirects=True).headers.get("Content-Length", 0))
+        except Exception:
+            size_in = None
     clock = time.time()
     with open(dst, "rb") as f:
         r = requests.put(inp["proxy_upload_url"], data=f, timeout=1800,
@@ -1269,7 +1481,7 @@ def prepare(inp):
     os.remove(dst)
     timings["total_s"] = round(time.time() - job_clock, 1)
     return {"task": "prepare", "encoder": encoder, "original": {"width": w, "height": h, "bytes": size_in},
-            "proxy": {"width": pw, "height": ph, "fps": fps, "bytes": size_out},
+            "proxy": {"width": pw, "height": ph, "fps": fps, "cq": cq, "bytes": size_out},
             "duration_s": round(duration, 2) if duration else None, "timings": timings}
 
 
@@ -1296,7 +1508,31 @@ def summarize(result):
         if f.get("calibrated") and len(xs[0]) >= 4 and len(xs[1]) >= 4:
             side.setdefault(int(f["t"] // 300) * 5, []).append(np.mean(xs[0]) < np.mean(xs[1]))
     timeline = {"%d min" % k: "%d%% (%d)" % (round(100 * np.mean(v)), len(v)) for k, v in sorted(side.items())}
-    return {"team0_left_by_5min": timeline,"timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
+    # Diagnostic par tranche de 5 min et par equipe : images avec >= 6 joueurs,
+    # nombre median de joueurs, x median des 3 joueurs les plus a gauche / a
+    # droite (gardien exclu) et x median du bloc. Sert a comparer deux analyses
+    # (original / copie allegee) quand un indicateur tactique differe.
+    pos = {}
+    for f in result.get("frames", []):
+        if not f.get("calibrated"):
+            continue
+        collapsed = not positions_plausible([(p["x"], p["y"]) for p in f["points"] if not p["ball"]])
+        for tm in (0, 1):
+            xs = sorted(p["x"] for p in f["points"] if not p["ball"] and p["team"] == tm)
+            if len(xs) < 6:
+                continue
+            lo = xs[1:] if xs[1] - xs[0] >= KEEPER_GAP_M else xs
+            hi = xs[:-1] if xs[-1] - xs[-2] >= KEEPER_GAP_M else xs
+            pos.setdefault((int(f["t"] // 300) * 5, tm), []).append((len(xs), np.mean(lo[:3]), np.mean(hi[-3:]), np.mean(xs), collapsed))
+    positions = {}
+    for (k, tm), v in sorted(pos.items()):
+        a = np.array(v)
+        positions.setdefault("%d min" % k, {})["team%d" % tm] = {
+            "frames": len(v), "collapsed": int(a[:, 4].sum()), "players": float(np.median(a[:, 0])),
+            "left3_x": round(float(np.median(a[:, 1])), 1), "right3_x": round(float(np.median(a[:, 2])), 1),
+            "mean_x": round(float(np.median(a[:, 3])), 1)}
+    return {"team0_left_by_5min": timeline, "positions_by_5min": positions,
+            "timings": result.get("timings"), "pitch_calibration": result.get("pitch_calibration"),
             "tactical": result.get("tactical"), "total_frames": result.get("total_frames"),
             "tracks": len(result.get("tracks", [])), "ball_frames": result.get("ball_frames"),
             "players_per_frame_median": float(np.median([len(f["points"]) for f in result.get("frames", [])] or [0]))}
@@ -1306,8 +1542,13 @@ def handler(job):
     inp = job["input"]
     if not inp.get("callback_url"):
         # Test direct (console RunPod) : pas d'application a prevenir, on renvoie un resume.
+        if inp.get("task") == "prepare":
+            try:
+                return {"status": "proxy_ready", "result": prepare(inp)}
+            except Exception as e:
+                return {"status": "proxy_failed", "error": str(e)[:900]}
         if inp.get("task"):
-            return {"status": "failed", "error": "direct test supports the default analysis only"}
+            return {"status": "failed", "error": "direct test supports the default analysis and prepare only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
