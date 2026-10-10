@@ -213,6 +213,20 @@ def score_batch(v, model, Hs, T=15.0, Tm=1.5, min_n=40):
 # Plages realistes d'une vue Veo (image de travail de 1280 px) : zoom et inclinaison.
 F_RANGE = (450.0, 2600.0)
 F_TILT = (-1.0, 16.0)
+GLOBAL_NF = 13       # nombre de focales essayees par la recherche complete
+TILT_STEP = 1.0      # pas d'inclinaison (degres) de la recherche complete
+
+# "veo" : camera panoramique au bord du terrain. "wide" : video 16:9 qui suit le jeu
+# (camera de tribune ou de diffusion) : zoom plus serre et camera plus inclinee.
+VIEW_MODES = {"veo": {"f": (450.0, 2600.0), "tilt": (-1.0, 16.0), "nf": 13, "tstep": 1.0},
+              "wide": {"f": (450.0, 6500.0), "tilt": (-1.0, 35.0), "nf": 18, "tstep": 1.5}}
+
+
+def set_view_mode(mode):
+    """A appeler avant le suivi (et avant de lancer les processus de calage)."""
+    global F_RANGE, F_TILT, GLOBAL_NF, TILT_STEP
+    m = VIEW_MODES.get(mode, VIEW_MODES["veo"])
+    F_RANGE, F_TILT, GLOBAL_NF, TILT_STEP = m["f"], m["tilt"], m["nf"], m["tstep"]
 
 
 def _plausible(p):
@@ -245,8 +259,8 @@ def local_search(v, model, C, p, dp=(1.0, 0.4, 0.04), cx=640.0, cy=268.0):
 def global_search(v, model, C, cx=640.0, cy=268.0, keep=16):
     """Recherche sur tous les reglages possibles (demarrage, ou camera perdue)."""
     th = np.radians(np.arange(-100, 100.1, 3.0))
-    ph = np.radians(np.arange(F_TILT[0], F_TILT[1] + 0.1, 1.0))
-    fs = np.geomspace(F_RANGE[0], F_RANGE[1], 13)
+    ph = np.radians(np.arange(F_TILT[0], F_TILT[1] + 0.1, TILT_STEP))
+    fs = np.geomspace(F_RANGE[0], F_RANGE[1], GLOBAL_NF)
     cands = []
     TH, PH = np.meshgrid(th, ph, indexing='ij')
     base = np.column_stack([TH.ravel(), PH.ravel()])
@@ -505,7 +519,8 @@ def mean_score(views, model, C, P, cx, cy):
                           for k, v in enumerate(views)]))
 
 
-def estimate_camera(frames, L, W, prior=None, max_views=CAMERA_MAX_VIEWS, log=print):
+def estimate_camera(frames, L, W, prior=None, max_views=CAMERA_MAX_VIEWS, log=print,
+                    bounds=None, heights=None):
     """Position de la camera a partir d'images d'un match (camera fixe type Veo).
 
     frames : iterateur d'images BGR (pleine taille ou de travail), dans l'ordre,
@@ -545,16 +560,17 @@ def estimate_camera(frames, L, W, prior=None, max_views=CAMERA_MAX_VIEWS, log=pr
     # plus loin, moins inclinee, dessine presque le meme terrain) : plusieurs
     # departs en hauteur, on garde l'ajustement qui colle le mieux.
     best = None
-    for z0 in CAMERA_HEIGHTS:
+    B = bounds or CAMERA_BOUNDS
+    for z0 in (heights or CAMERA_HEIGHTS):
         Cz = np.array([C0[0], C0[1], z0])
         Pz = np.array([local_search(v, model, Cz, P0[k], dp=(2.0, 1.0, 0.08), cx=cx, cy=cy)[0]
                        for k, v in enumerate(views)])
         x0 = np.concatenate([Cz, (Pz / np.array([1.0, 1.0, 1000.0])).ravel()])
         # Bornes : poses realistes d'une camera de bord de terrain (la vallee plate
         # "plus haut et plus loin" ne doit pas emmener la solution n'importe ou).
-        lo = np.concatenate([[CAMERA_BOUNDS[0][0] * L, W + CAMERA_BOUNDS[1][0], CAMERA_BOUNDS[2][0]],
+        lo = np.concatenate([[B[0][0] * L, W + B[1][0], B[2][0]],
                              np.full(len(x0) - 3, -np.inf)])
-        hi = np.concatenate([[CAMERA_BOUNDS[0][1] * L, W + CAMERA_BOUNDS[1][1], CAMERA_BOUNDS[2][1]],
+        hi = np.concatenate([[B[0][1] * L, W + B[1][1], B[2][1]],
                              np.full(len(x0) - 3, np.inf)])
         r = least_squares(_joint_residuals, np.clip(x0, lo + 1e-6, hi - 1e-6), bounds=(lo, hi),
                           args=(views, model, cx, cy), method='trf',

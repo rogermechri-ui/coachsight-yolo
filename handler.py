@@ -685,10 +685,30 @@ def camera_frames(source, windows, n=CAMERA_SEGMENTS, dur=CAMERA_SEGMENT_S, fps=
             acc += we - ws
 
 
-def estimate_camera(source, windows, L, W):
-    """Position de la camera estimee sur la video elle-meme (camera fixe type Veo)."""
-    return pitch_track.estimate_camera(camera_frames(source, windows), L, W,
-                                       log=lambda s: print(s, flush=True))
+# Video 16:9 qui suit le jeu : la camera peut etre au bord du terrain (type Veo)
+# ou en tribune / cabine de diffusion, plus loin et plus haut. Un essai par pose
+# de depart (part de L, recul derriere la touche, hauteur), on garde le meilleur.
+WIDE_PRIORS = ((0.5, 4.0, 4.5), (0.5, 15.0, 9.0), (0.5, 28.0, 15.0))
+WIDE_BOUNDS = ((0.25, 0.75), (1.0, 45.0), (2.0, 25.0))
+
+
+def estimate_camera(source, windows, L, W, wide=False):
+    """Position de la camera estimee sur la video elle-meme."""
+    log = lambda s: print(s, flush=True)
+    if not wide:
+        return pitch_track.estimate_camera(camera_frames(source, windows), L, W, log=log)
+    best, tried = None, []
+    for pr in WIDE_PRIORS:
+        C, info = pitch_track.estimate_camera(camera_frames(source, windows), L, W, prior=pr, log=log,
+                                              bounds=WIDE_BOUNDS, heights=(pr[2] * 0.6, pr[2], pr[2] * 1.6))
+        tried.append({"prior": info.get("prior"), "frames_locked": info.get("frames_locked"),
+                      "score": info.get("score"), "camera": info.get("camera"), "error": info.get("error")})
+        if C is not None and (best is None or info["score"] < best[1]["score"]):
+            best = (C, info)
+    if best is None:
+        return None, {"error": "camera position not found", "tried": tried}
+    best[1]["tried"] = tried
+    return best
 
 
 def pitch_camera(inp):
@@ -964,6 +984,10 @@ def process(inp):
         timings["stream_fallback"] = "direct read not used: " + why
     h0, w0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     timings["video_size"] = "%dx%d" % (w0, h0)
+    # Video non panoramique (16:9...) : plages de zoom et d'inclinaison elargies.
+    wide = h0 > 0 and w0 / h0 < 2.0
+    pitch_track.set_view_mode("wide" if wide else "veo")
+    timings["view_mode"] = "wide" if wide else "veo"
     dur = video_end(cap)
     if dur:
         end = min(end, dur)
@@ -980,7 +1004,7 @@ def process(inp):
     camera_info = {"source": "given"} if camera is not None else {"source": "none"}
     if isinstance(camera, str):          # "auto" : position estimee sur la video
         clock = time.time()
-        camera, cinfo = estimate_camera(tmp or url, windows, L, W)
+        camera, cinfo = estimate_camera(tmp or url, windows, L, W, wide=wide)
         camera_info = {"source": "auto", **cinfo}
         timings["camera_s"] = round(time.time() - clock, 1)
     clock = time.time()
