@@ -51,7 +51,7 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
 # Calage du terrain image par image (camera Veo fixe, voir pitch_track.py).
 # Position de la camera par defaut "x,y,z" en metres (sinon envoyee par
 # l'application dans pitch.camera) ; vide = pas de calage automatique.
-PITCH_CAMERA = os.environ.get("PITCH_CAMERA", "").strip()
+PITCH_CAMERA = os.environ.get("PITCH_CAMERA", "").strip().lower()   # "Auto" = "auto"
 # Mouvement de la camera suivi plusieurs fois par seconde (panoramiques rapides).
 MOTION_FPS = float(os.environ.get("MOTION_FPS", "6"))
 # Processus de calage en parallele (tranches du match).
