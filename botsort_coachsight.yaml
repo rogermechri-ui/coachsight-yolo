@@ -1,0 +1,14 @@
+# Suivi des joueurs CoachSight (TRACKER=v2) : BoT-SORT d'Ultralytics, regle pour
+# des matchs filmes de loin, avec une camera qui suit le jeu, a 6 images/s.
+tracker_type: botsort
+track_high_thresh: 0.3     # detections sures : premier appariement
+track_low_thresh: 0.1      # detections faibles (joueurs lointains, masques) : second appariement
+new_track_thresh: 0.4      # pas de nouvelle piste sur une detection douteuse
+track_buffer: 60           # une piste perdue reste recuperable 10 s (60 images a 6 i/s)
+match_thresh: 0.8
+fuse_score: True
+gmc_method: sparseOptFlow  # compensation du mouvement de la camera (panoramiques)
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True            # apparence du joueur, tiree du detecteur lui-meme ("auto") : peu couteux
+model: auto

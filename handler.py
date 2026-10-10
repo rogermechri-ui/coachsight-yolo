@@ -67,6 +67,23 @@ YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "1280"))
 # En dessous (cas des videos panoramiques), les chiffres sont illisibles et
 # la lecture ne fait que ralentir l'analyse.
 OCR_MIN_HEIGHT = int(os.environ.get("OCR_MIN_HEIGHT", "90"))
+# Suivi des joueurs, version 2 (audit du 10/10 : un joueur etait "perdu" au bout
+# de 2 s en mediane et les equipes derivaient au fil du match, sur tous les matchs).
+#  - suivi dans l'image (BoT-SORT : compensation du mouvement de la camera +
+#    apparence), independant du calage du terrain ;
+#  - images analysees plus souvent pour le suivi (TRACK_FPS), resultats toujours
+#    rendus a 2 images/s ;
+#  - recollage des morceaux de piste d'un meme joueur (position, delai, couleur) ;
+#  - equipes par tranches de temps (soleil / ombre), avec la clarte du maillot
+#    mesuree par rapport a la pelouse autour du joueur.
+# TRACKER=v1 revient a l'ancien suivi (plus proche voisin sur le terrain, 2 i/s).
+TRACKER = os.environ.get("TRACKER", "v2").strip().lower()
+TRACK_FPS = float(os.environ.get("TRACK_FPS", "6"))
+TRACKER_CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort_coachsight.yaml")
+GMC_WIDTH = int(os.environ.get("GMC_WIDTH", "640"))       # largeur de travail de la compensation de mouvement
+TRACK_STITCH_S = float(os.environ.get("TRACK_STITCH_S", "8"))       # trou maximal recolle
+TRACK_STITCH_COLOR = float(os.environ.get("TRACK_STITCH_COLOR", "28"))
+TEAM_WINDOW_S = float(os.environ.get("TEAM_WINDOW_S", "300"))      # tranche de temps des equipes
 
 
 def shirt_color(frame, box):
@@ -87,8 +104,21 @@ def shirt_color(frame, box):
     # Clarte : 90e centile plutot que la mediane. Un joueur lointain en maillot
     # clair se melange aux panneaux sombres derriere lui ; sa mediane le classait
     # dans l'equipe en maillot fonce.
-    return np.array([np.percentile(keep[:, 0], 90), np.median(keep[:, 1]), np.median(keep[:, 2])],
-                    dtype=np.float32)
+    light = float(np.percentile(keep[:, 0], 90))
+    # 4e valeur : clarte du maillot moins celle de la pelouse autour du joueur.
+    # Un maillot blanc a l'ombre reste plus clair que la pelouse a l'ombre : cette
+    # difference change peu entre soleil et ombre (la clarte brute, beaucoup).
+    gx1, gx2 = max(x1 - w, 0), max(x2 + w, 0)
+    gy1, gy2 = max(y1 + h // 2, 0), max(y2 + h // 3, 0)
+    ring = frame[gy1:gy2, gx1:gx2]
+    rel = np.nan
+    if ring.size:
+        rh = cv2.cvtColor(ring, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        g = (rh[:, 0] >= 30) & (rh[:, 0] <= 90) & (rh[:, 1] > 50) & (rh[:, 2] > 30)
+        if g.sum() >= 10:
+            rl = cv2.cvtColor(ring, cv2.COLOR_BGR2LAB).reshape(-1, 3)[g, 0].astype(np.float32)
+            rel = light - float(np.median(rl))
+    return np.array([light, np.median(keep[:, 1]), np.median(keep[:, 2]), rel], dtype=np.float32)
 
 
 def read_number(frame, box):
@@ -580,9 +610,18 @@ def track(source, windows, fps_out, timings):
     t_read = t_detect = t_color = t_ocr = 0.0
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
-    for ws, we in windows:
+    v2 = TRACKER == "v2"
+    # v2 : images lues TRACK_FPS fois par seconde pour le suivi ; seules celles
+    # de la grille a fps_out (2/s) sont gardees dans les resultats.
+    ratio = max(1, int(round(TRACK_FPS / fps_out))) if v2 else 1
+    for wi, (ws, we) in enumerate(windows):
         clock = time.time()
-        for t, frame in read_frames(source, ws, we, fps_out, width=DETECT_WIDTH):
+        if v2:
+            MODEL.predictor = None       # suivi vierge a chaque periode (mi-temps)
+        k = -1
+        for t, frame in read_frames(source, ws, we, fps_out * ratio, width=DETECT_WIDTH):
+            k += 1
+            keep_frame = k % ratio == 0
             t_read += time.time() - clock
             h, w = frame.shape[:2]
             c = time.time()
@@ -591,12 +630,26 @@ def track(source, windows, fps_out, timings):
                 if crop[2] - crop[0] < w // 2 or crop[3] - crop[1] < h // 2:
                     crop = None          # image noire (debut de video) : on reessaiera
             x0, y0, x1, y1 = crop or (0, 0, w, h)
-            # Detection seule (pas le suivi integre de YOLO : a 2 images/s avec une
-            # camera qui bouge, il ne garde que quelques joueurs et jette les autres).
-            # Les identifiants sont attribues ensuite, sur le terrain (assign_ids).
-            res = MODEL.predict(frame[y0:y1, x0:x1], classes=[0, 32], conf=0.25,
-                                imgsz=YOLO_IMGSZ, verbose=False)[0]
+            if v2:
+                # Suivi BoT-SORT dans l'image : la compensation du mouvement de la
+                # camera et l'apparence gardent l'identite d'un joueur entre images.
+                res = MODEL.track(frame[y0:y1, x0:x1], classes=[0, 32], conf=0.1, persist=True,
+                                  tracker=TRACKER_CFG, imgsz=YOLO_IMGSZ, verbose=False)[0]
+                try:     # compensation du mouvement sur une image reduite (~640 px) : rapide
+                    gmc = MODEL.predictor.trackers[0].gmc
+                    gmc.downscale = max(2, (x1 - x0) // GMC_WIDTH)
+                except Exception:
+                    pass
+            else:
+                # Detection seule (le suivi integre de YOLO a 2 images/s avec une
+                # camera qui bouge ne garde que quelques joueurs). Les identifiants
+                # sont attribues ensuite, sur le terrain (assign_ids).
+                res = MODEL.predict(frame[y0:y1, x0:x1], classes=[0, 32], conf=0.25,
+                                    imgsz=YOLO_IMGSZ, verbose=False)[0]
             t_detect += time.time() - c
+            if not keep_frame:
+                clock = time.time()
+                continue
             pts = []
             if res.boxes is not None:
                 ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
@@ -607,7 +660,8 @@ def track(source, windows, fps_out, timings):
                     c = time.time()
                     col = None if ball else shirt_color(frame, box)
                     t_color += time.time() - c
-                    tid_i = int(tid) if tid is not None else -1
+                    # identifiants uniques d'une periode a l'autre
+                    tid_i = int(tid) + wi * 1000000 if (tid is not None and not ball) else -1
                     if (not ball and READ_NUMBERS and pytesseract is not None
                             and tid_i >= 0 and frame_i % OCR_EVERY_N == 0):
                         c = time.time()
@@ -753,6 +807,150 @@ def assign_ids(placed, gate=4.0, max_gap_s=1.5):
             new.append((ids[i],) + tuple(p[1:]))
         out.append((t, new))
     return out
+
+
+def _team_feat(col):
+    """Couleur servant aux equipes : clarte relative a la pelouse (sinon brute), a, b."""
+    rel = col[3] if len(col) > 3 and np.isfinite(col[3]) else None
+    return np.array([rel if rel is not None else col[0] - 100.0, col[1], col[2]], dtype=np.float32)
+
+
+def stitch_tracks(placed, cal_flags, max_gap_s=TRACK_STITCH_S, speed=8.0, slack=3.0,
+                  col_max=TRACK_STITCH_COLOR):
+    """Recolle les morceaux de piste d'un meme joueur (perdu derriere un autre,
+    sorti puis revenu dans l'image) : un morceau qui se termine et un autre qui
+    commence peu apres, a une distance atteignable en courant, avec un maillot de
+    couleur proche. Appariement glouton du plus sur au moins sur, un successeur
+    et un predecesseur au plus par morceau. Positions en metres (calage) ou en
+    approximation lineaire de l'image sinon ; on ne recolle pas un morceau cale
+    avec un morceau non cale."""
+    info = {}
+    for i, (t, pts) in enumerate(placed):
+        cal = bool(cal_flags[i]) if i < len(cal_flags) else False
+        for tid, x, y, ball, col in pts:
+            if ball or tid < 0:
+                continue
+            d = info.get(tid)
+            if d is None:
+                d = info[tid] = {"t0": t, "p0": (x, y), "c0": cal, "cols": []}
+            d["t1"], d["p1"], d["c1"] = t, (x, y), cal
+            if col is not None:
+                d["cols"].append(_team_feat(col))
+    feat = {tid: (np.median(np.array(d["cols"]), axis=0) if d["cols"] else None) for tid, d in info.items()}
+    by_start = sorted(info, key=lambda k: info[k]["t0"])
+    starts = [info[k]["t0"] for k in by_start]
+    import bisect
+    cand = []
+    for a, da in info.items():
+        lo = bisect.bisect_right(starts, da["t1"])
+        hi = bisect.bisect_right(starts, da["t1"] + max_gap_s)
+        for b in by_start[lo:hi]:
+            db = info[b]
+            if da["c1"] != db["c0"]:
+                continue
+            gap = db["t0"] - da["t1"]
+            reach = slack + speed * gap
+            dist = float(np.hypot(da["p1"][0] - db["p0"][0], da["p1"][1] - db["p0"][1]))
+            if dist > reach:
+                continue
+            if feat[a] is not None and feat[b] is not None:
+                cd = float(np.linalg.norm(feat[a] - feat[b]))
+                if cd > col_max:
+                    continue
+            else:
+                cd = col_max / 2
+            cand.append((dist / reach + cd / col_max + gap / max_gap_s, a, b))
+    cand.sort()
+    succ, pred = {}, {}
+    for _, a, b in cand:
+        if a in succ or b in pred:
+            continue
+        succ[a], pred[b] = b, a
+    root = {}
+    for tid in by_start:
+        root[tid] = root[pred[tid]] if tid in pred else tid
+    out = [(t, [((root.get(p[0], p[0]),) + tuple(p[1:])) if p[0] >= 0 else p for p in pts])
+           for t, pts in placed]
+    return out, {"before": len(info), "after": len(set(root.values())), "map": root}
+
+
+def teams_whole_match(placed):
+    """Equipes v1 : un seul regroupement des couleurs pour tout le match."""
+    cols = np.array([p[4][:3] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
+    if len(cols) < 4:
+        return {}, (lambda col: None), None
+    _, labels, centers = cv2.kmeans(cols, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0), 3, cv2.KMEANS_PP_CENTERS)
+    # Arbitres (jaune fluo), gardiens et remplacants en chasuble : teinte tres
+    # differente des deux maillots -> sans equipe (sinon ils gonflent une equipe).
+    hue_d = np.linalg.norm(cols[:, 1:] - centers[labels.ravel()][:, 1:], axis=1)
+    hue_limit = max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d)))
+
+    def color_team(col):
+        if col is None:
+            return None
+        col = np.asarray(col)[:3]
+        k = int(np.argmin(np.linalg.norm(centers - col, axis=1)))
+        return k if np.linalg.norm(col[1:] - centers[k][1:]) <= hue_limit else None
+
+    # Equipe de chaque piste : vote sur toutes ses images.
+    team_votes = {}
+    for _, pts in placed:
+        for tid, x, y, ball, col in pts:
+            if not ball and tid >= 0 and col is not None:
+                team_votes.setdefault(tid, Counter())[color_team(col)] += 1
+    track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
+    return track_team, color_team, centers
+
+
+def teams_by_window(placed, window_s=TEAM_WINDOW_S):
+    """Equipes v2. La lumiere change pendant un match (soleil, ombre des tribunes,
+    eclairage du soir) : un seul regroupement des couleurs pour tout le match
+    faisait passer des equipes entieres d'un cote a l'autre. Ici :
+    - couleur de chaque piste par tranche de temps (clarte relative a la pelouse) ;
+    - deux groupes par tranche, relies a ceux de la tranche precedente (les
+      couleurs evoluent lentement) ;
+    - arbitres / gardiens (teinte loin des deux maillots) sans equipe ;
+    - equipe d'une piste = vote sur toutes ses tranches."""
+    per = {}
+    for t, pts in placed:
+        w = int(t // window_s)
+        for tid, x, y, ball, col in pts:
+            if ball or tid < 0 or col is None:
+                continue
+            per.setdefault((tid, w), []).append(col)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    prev = None
+    votes = {}
+    abs_cols = {0: [], 1: []}
+    all_centers = []
+    for w in sorted({k[1] for k in per}):
+        keys = [k for k in per if k[1] == w and len(per[k]) >= 2]
+        if len(keys) < 6:
+            continue
+        cols = [np.array(per[k]) for k in keys]
+        feats = np.array([np.median(np.array([_team_feat(c) for c in cs]), axis=0) for cs in cols], np.float32)
+        _, labels, centers = cv2.kmeans(feats, 2, None, crit, 5, cv2.KMEANS_PP_CENTERS)
+        labels = labels.ravel()
+        if prev is not None:
+            same = np.linalg.norm(centers[0] - prev[0]) + np.linalg.norm(centers[1] - prev[1])
+            swap = np.linalg.norm(centers[0] - prev[1]) + np.linalg.norm(centers[1] - prev[0])
+            if swap < same:
+                centers = centers[::-1].copy()
+                labels = 1 - labels
+        prev = centers if prev is None else 0.5 * prev + 0.5 * centers
+        all_centers.append(centers)
+        hue_d = np.linalg.norm(feats[:, 1:] - centers[labels][:, 1:], axis=1)
+        hue_limit = max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d)))
+        for k, lab, hd, cs in zip(keys, labels, hue_d, cols):
+            team = int(lab) if hd <= hue_limit else None
+            votes.setdefault(k[0], Counter())[team] += len(cs)
+            if team is not None:
+                abs_cols[team].extend(c[:3] for c in cs)
+    track_team = {tid: c.most_common(1)[0][0] for tid, c in votes.items()}
+    team_rgb = None
+    if abs_cols[0] and abs_cols[1]:
+        team_rgb = np.array([np.median(np.array(abs_cols[i]), axis=0) for i in (0, 1)], np.float32)
+    return track_team, (lambda col: None), team_rgb
 
 
 def with_memory(frames, per_frame_H, size, memory_s=MEMORY_S):
@@ -1044,33 +1242,20 @@ def process(inp):
         placed.append((tt, keep))
         cal_flags.append(Hf is not None or H is not None)
 
-    placed = assign_ids(placed)
-    cols = np.array([p[4] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
-    centers = None
-    hue_limit = None
-    if len(cols) >= 4:
-        _, labels, centers = cv2.kmeans(cols, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0), 3, cv2.KMEANS_PP_CENTERS)
-        # Arbitres (jaune fluo), gardiens et remplacants en chasuble : teinte tres
-        # differente des deux maillots -> sans equipe (sinon ils gonflent une equipe).
-        hue_d = np.linalg.norm(cols[:, 1:] - centers[labels.ravel()][:, 1:], axis=1)
-        hue_limit = max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d)))
+    if TRACKER == "v2":
+        placed, stitch = stitch_tracks(placed, cal_flags)
+        timings["tracks_before_stitch"] = stitch["before"]
+        timings["tracks_after_stitch"] = stitch["after"]
+        merged = {}
+        for tid, c in votes.items():
+            merged.setdefault(stitch["map"].get(tid, tid), Counter()).update(c)
+        votes = merged
+        track_team, color_team, team_rgb = teams_by_window(placed)
+    else:
+        placed = assign_ids(placed)
+        track_team, color_team, team_rgb = teams_whole_match(placed)
     # Numero retenu par piste : celui le plus souvent lu (vote majoritaire).
     numbers = {tid: c.most_common(1)[0][0] for tid, c in votes.items()}
-    def color_team(col):
-        if col is None or centers is None:
-            return None
-        k = int(np.argmin(np.linalg.norm(centers - col, axis=1)))
-        return k if np.linalg.norm(np.asarray(col)[1:] - centers[k][1:]) <= hue_limit else None
-
-    # Equipe de chaque piste : vote sur toutes ses images (une image a l'ombre ou
-    # un joueur masque ne change pas d'equipe) ; sans equipe si le plus souvent
-    # hors des deux maillots (arbitre, gardien).
-    team_votes = {}
-    for _, pts in placed:
-        for tid, x, y, ball, col in pts:
-            if not ball and tid >= 0 and col is not None:
-                team_votes.setdefault(tid, Counter())[color_team(col)] += 1
-    track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
     # Vue de chaque image pour les dessins tactiques cote site : homographie
     # terrain (metres) -> image (0..1), 9 nombres, H[2][2] = 1 ; None sans calage.
     def view_of(i):
@@ -1114,11 +1299,10 @@ def process(inp):
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
-    if centers is not None:
-        for i, lab in enumerate(centers):
-            px = np.uint8([[np.clip(lab, 0, 255)]])
-            b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
-            team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
+    for i, lab in enumerate(team_rgb or []):
+        px = np.uint8([[np.clip(lab, 0, 255)]])
+        b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
+        team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
     calibration = {"calibrated": H is not None, "points": len((inp.get("pitch_calibration") or {}).get("points") or []),
                    "mean_error_m": round(calib_err, 2) if calib_err is not None else None}
     calibration["camera_estimate"] = camera_info
