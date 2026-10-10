@@ -15,6 +15,13 @@ def audit(path):
     r = r.get("output", r)  # fichier brut RunPod ou resultat seul
     frames = r.get("frames") or []
     tracks = r.get("tracks") or []
+    if not tracks:  # le site ne garde pas "tracks" : on les refait depuis les images
+        tv = {}
+        for fr in frames:
+            for p in fr.get("points", []):
+                if not p.get("ball") and p.get("trackId", -1) >= 0:
+                    tv.setdefault(p["trackId"], (p.get("team"), p.get("number")))
+        tracks = [{"track_id": k, "team": v[0], "number": v[1]} for k, v in tv.items()]
     per_team = {0: [], 1: []}
     no_team, total = [], []
     for fr in frames:
