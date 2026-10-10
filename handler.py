@@ -1440,6 +1440,12 @@ def prepare(inp):
     width = int(inp.get("proxy_width", PROXY_WIDTH))
     fps = int(inp.get("proxy_fps", PROXY_FPS))
     cq = int(inp.get("proxy_cq", PROXY_CQ))
+    if w and w <= width:
+        # Video deja a la taille de la copie (ou plus petite) : la re-encoder la
+        # rendrait plus lourde sans rien gagner. Les analyses gardent l'original.
+        if not src.startswith("http"):
+            os.remove(src)
+        raise RuntimeError("proxy not needed: video is already %dx%d (copy width %d)" % (w, h, width))
     dst = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     clock = time.time()
     encoder, errors = None, []
@@ -1472,6 +1478,11 @@ def prepare(inp):
             size_in = int(requests.head(src, timeout=60, allow_redirects=True).headers.get("Content-Length", 0))
         except Exception:
             size_in = None
+    if size_in and size_out >= 0.9 * size_in:
+        # Copie a peine plus legere (ou plus lourde) que l'original : inutile.
+        os.remove(dst)
+        raise RuntimeError("proxy not needed: copy %.2f GB is not smaller than the original %.2f GB"
+                           % (size_out / 1e9, size_in / 1e9))
     clock = time.time()
     with open(dst, "rb") as f:
         r = requests.put(inp["proxy_upload_url"], data=f, timeout=1800,
