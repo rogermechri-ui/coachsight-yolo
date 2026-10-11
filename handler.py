@@ -84,6 +84,16 @@ GMC_WIDTH = int(os.environ.get("GMC_WIDTH", "640"))       # largeur de travail d
 TRACK_STITCH_S = float(os.environ.get("TRACK_STITCH_S", "8"))       # trou maximal recolle
 TRACK_STITCH_COLOR = float(os.environ.get("TRACK_STITCH_COLOR", "28"))
 TEAM_WINDOW_S = float(os.environ.get("TEAM_WINDOW_S", "300"))      # tranche de temps des equipes
+# Teinte de pelouse (OpenCV, 0..180) : a partir de 34 et non 30, sinon le jaune
+# vif des arbitres et des chasubles etait pris pour de la pelouse et ignore.
+GRASS_HUE_MIN = int(os.environ.get("GRASS_HUE_MIN", "34"))
+# Ecart de teinte maximal (Lab a,b) pour appartenir a une equipe : au-dela,
+# arbitre / gardien / chasuble (sans equipe). Plafonne : la limite adaptative
+# (3 x mediane) laissait parfois passer l'arbitre (verification du 11/10).
+TEAM_HUE_MAX = float(os.environ.get("TEAM_HUE_MAX", "30"))
+# Personnes hors du jeu (bancs, remplacants, staff, public, arbitres assistants) :
+# pistes qui restent le long ou au-dela d'une ligne du terrain.
+OFF_PITCH_DEPTH_M = float(os.environ.get("OFF_PITCH_DEPTH_M", "3"))
 
 
 def shirt_color(frame, box):
@@ -96,7 +106,7 @@ def shirt_color(frame, box):
     if crop.size == 0:
         return None
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    grass = (hsv[:, 0] >= 30) & (hsv[:, 0] <= 90) & (hsv[:, 1] > 50) & (hsv[:, 2] > 30)
+    grass = (hsv[:, 0] >= GRASS_HUE_MIN) & (hsv[:, 0] <= 90) & (hsv[:, 1] > 50) & (hsv[:, 2] > 30)
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
     keep = lab[~grass]
     if len(keep) < max(4, 0.15 * len(lab)):
@@ -114,7 +124,7 @@ def shirt_color(frame, box):
     rel = np.nan
     if ring.size:
         rh = cv2.cvtColor(ring, cv2.COLOR_BGR2HSV).reshape(-1, 3)
-        g = (rh[:, 0] >= 30) & (rh[:, 0] <= 90) & (rh[:, 1] > 50) & (rh[:, 2] > 30)
+        g = (rh[:, 0] >= GRASS_HUE_MIN) & (rh[:, 0] <= 90) & (rh[:, 1] > 50) & (rh[:, 2] > 30)
         if g.sum() >= 10:
             rl = cv2.cvtColor(ring, cv2.COLOR_BGR2LAB).reshape(-1, 3)[g, 0].astype(np.float32)
             rel = light - float(np.median(rl))
@@ -877,6 +887,38 @@ def stitch_tracks(placed, cal_flags, max_gap_s=TRACK_STITCH_S, speed=8.0, slack=
     return out, {"before": len(info), "after": len(set(root.values())), "map": root}
 
 
+def drop_off_pitch(placed, cal_flags, L, W, depth_m=OFF_PITCH_DEPTH_M, min_pts=6):
+    """Retire les personnes qui ne jouent pas : remplacants et staff sur les
+    bancs, public, arbitres assistants. Un joueur entre dans le terrain ; eux
+    restent le long ou au-dela d'une ligne (touche, ligne de but) pendant toute
+    leur piste. Regle par piste (apres recollage), sur les images calees :
+    - 90 % du temps a moins de depth_m de la ligne la plus proche, et peu de
+      deplacement le long de la ligne (< 10 m : banc, public) ; ou
+    - 90 % du temps a moins de depth_m / 2 de la ligne (arbitre assistant qui
+      court le long de la touche).
+    Sans calage (pas de positions en metres), rien n'est retire."""
+    pos = {}
+    for i, (t, pts) in enumerate(placed):
+        if i >= len(cal_flags) or not cal_flags[i]:
+            continue
+        for tid, x, y, ball, col in pts:
+            if not ball and tid >= 0:
+                pos.setdefault(tid, []).append((x, y))
+    off = set()
+    for tid, ps in pos.items():
+        if len(ps) < min_pts:
+            continue
+        a = np.array(ps)
+        depth = np.minimum.reduce([a[:, 0], L - a[:, 0], a[:, 1], W - a[:, 1]])
+        d90 = float(np.percentile(depth, 90))
+        spread = max(float(np.percentile(a[:, 0], 90) - np.percentile(a[:, 0], 10)),
+                     float(np.percentile(a[:, 1], 90) - np.percentile(a[:, 1], 10)))
+        if (d90 < depth_m and spread < 10.0) or d90 < depth_m / 2:
+            off.add(tid)
+    out = [(t, [p for p in pts if p[3] or p[0] not in off]) for t, pts in placed]
+    return out, len(off)
+
+
 def teams_whole_match(placed):
     """Equipes v1 : un seul regroupement des couleurs pour tout le match."""
     cols = np.array([p[4][:3] for _, pts in placed for p in pts if p[4] is not None], dtype=np.float32)
@@ -943,7 +985,7 @@ def teams_by_window(placed, window_s=TEAM_WINDOW_S):
         prev = centers if prev is None else 0.5 * prev + 0.5 * centers
         all_centers.append(centers)
         hue_d = np.linalg.norm(feats[:, 1:] - centers[labels][:, 1:], axis=1)
-        hue_limit = max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d)))
+        hue_limit = min(TEAM_HUE_MAX, max(TEAM_HUE_MIN, 3.0 * float(np.median(hue_d))))
         for k, lab, hd, cs in zip(keys, labels, hue_d, cols):
             team = int(lab) if hd <= hue_limit else None
             votes.setdefault(k[0], Counter())[team] += len(cs)
