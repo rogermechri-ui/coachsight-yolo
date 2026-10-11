@@ -608,6 +608,7 @@ def track(source, windows, fps_out, timings):
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
+    t_yolo = 0.0     # part du modele (preparation + reseau + tri) dans t_detect ; le reste = suivi
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
     v2 = TRACKER == "v2"
@@ -647,6 +648,7 @@ def track(source, windows, fps_out, timings):
                 res = MODEL.predict(frame[y0:y1, x0:x1], classes=[0, 32], conf=0.25,
                                     imgsz=YOLO_IMGSZ, verbose=False)[0]
             t_detect += time.time() - c
+            t_yolo += sum((getattr(res, "speed", None) or {}).values()) / 1000.0
             if not keep_frame:
                 clock = time.time()
                 continue
@@ -674,6 +676,7 @@ def track(source, windows, fps_out, timings):
             frame_i += 1
             clock = time.time()
     timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
+                   yolo_s=round(t_yolo, 1), tracker_s=round(t_detect - t_yolo, 1), track_fps=fps_out * ratio,
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
                    numbers_read=sum(sum(c.values()) for c in votes.values()))
     return raw, votes
