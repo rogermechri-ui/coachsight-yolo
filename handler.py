@@ -1299,7 +1299,7 @@ def process(inp):
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
-    for i, lab in enumerate(team_rgb or []):
+    for i, lab in enumerate([] if team_rgb is None else team_rgb):
         px = np.uint8([[np.clip(lab, 0, 255)]])
         b, g, r = cv2.cvtColor(px, cv2.COLOR_LAB2BGR)[0][0]
         team_colors.append({"team": i, "hex": "#%02x%02x%02x" % (r, g, b)})
@@ -1778,6 +1778,8 @@ def handler(job):
         result = process(inp)
         cb.update(status="completed", result=result, stats={"frames": len(result["frames"]), "tracks": len(result.get("tracks", []))})
     except Exception as e:
+        import traceback
+        print("ANALYSIS_FAILED " + traceback.format_exc(), flush=True)   # visible dans les journaux RunPod
         cb.update(status="failed", error=str(e)[:900])
     requests.post(inp["callback_url"], json=cb, timeout=120)
     return {"status": cb["status"], "frames": len(cb.get("result", {}).get("frames", []))}
