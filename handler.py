@@ -94,6 +94,13 @@ TEAM_HUE_MAX = float(os.environ.get("TEAM_HUE_MAX", "30"))
 # Personnes hors du jeu (bancs, remplacants, staff, public, arbitres assistants) :
 # pistes qui restent le long ou au-dela d'une ligne du terrain.
 OFF_PITCH_DEPTH_M = float(os.environ.get("OFF_PITCH_DEPTH_M", "3"))
+# Personnes immobiles (bancs, public, staff) reperees dans l'image, sans calage :
+# le mouvement de la camera est retire, puis on mesure la vitesse propre de
+# chaque piste en hauteurs de personne par seconde (1 hauteur ~ 1,8 m). Une piste
+# d'au moins STATIC_MIN_S secondes dont 75 % des vitesses sont sous STATIC_SPEED
+# est retiree. 0 = desactive.
+STATIC_MIN_S = float(os.environ.get("STATIC_MIN_S", "20"))
+STATIC_SPEED = float(os.environ.get("STATIC_SPEED", "0.25"))
 
 
 def shirt_color(frame, box):
@@ -625,10 +632,14 @@ def track(source, windows, fps_out, timings):
     # v2 : images lues TRACK_FPS fois par seconde pour le suivi ; seules celles
     # de la grille a fps_out (2/s) sont gardees dans les resultats.
     ratio = max(1, int(round(TRACK_FPS / fps_out))) if v2 else 1
+    warps = []        # mouvements de camera (2x3) depuis la derniere image gardee
+    motion = {}       # piste -> [(t, x, y stabilises, hauteur)] pour reperer les immobiles
     for wi, (ws, we) in enumerate(windows):
         clock = time.time()
         if v2:
             MODEL.predictor = None       # suivi vierge a chaque periode (mi-temps)
+        G = np.eye(3)    # image de reference de la periode -> image courante
+        warps.clear()
         k = -1
         for t, frame in read_frames(source, ws, we, fps_out * ratio, width=DETECT_WIDTH):
             k += 1
@@ -649,6 +660,14 @@ def track(source, windows, fps_out, timings):
                 try:     # compensation du mouvement sur une image reduite (~640 px) : rapide
                     gmc = MODEL.predictor.trackers[0].gmc
                     gmc.downscale = max(2, (x1 - x0) // GMC_WIDTH)
+                    if not getattr(gmc, "_cs_logged", False):
+                        # on garde aussi le mouvement de camera calcule par le suivi
+                        def _apply(img, dets=None, _orig=gmc.apply):
+                            W_ = _orig(img, dets)
+                            warps.append(np.asarray(W_, dtype=float))
+                            return W_
+                        gmc.apply = _apply
+                        gmc._cs_logged = True
                 except Exception:
                     pass
             else:
@@ -663,6 +682,15 @@ def track(source, windows, fps_out, timings):
                 clock = time.time()
                 continue
             pts = []
+            if v2:
+                for W_ in warps:
+                    if W_.shape == (2, 3) and np.all(np.isfinite(W_)):
+                        G = np.vstack([W_, [0, 0, 1]]) @ G
+                warps.clear()
+                try:
+                    Ginv = np.linalg.inv(G)
+                except np.linalg.LinAlgError:
+                    G, Ginv = np.eye(3), np.eye(3)
             if res.boxes is not None:
                 ids = res.boxes.id.tolist() if res.boxes.id is not None else [None] * len(res.boxes)
                 for box, cls, tid in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), ids):
@@ -674,6 +702,9 @@ def track(source, windows, fps_out, timings):
                     t_color += time.time() - c
                     # identifiants uniques d'une periode a l'autre
                     tid_i = int(tid) + wi * 1000000 if (tid is not None and not ball) else -1
+                    if v2 and tid_i >= 0 and STATIC_MIN_S > 0:
+                        sx, sy, sw = Ginv @ np.array([cx - x0, cy - y0, 1.0])
+                        motion.setdefault(tid_i, []).append((t, sx / sw, sy / sw, max(1.0, box[3] - box[1]), cx / w, cy / h))
                     if (not ball and READ_NUMBERS and pytesseract is not None
                             and tid_i >= 0 and frame_i % OCR_EVERY_N == 0):
                         c = time.time()
@@ -685,11 +716,23 @@ def track(source, windows, fps_out, timings):
             raw.append((round(t, 2), pts))
             frame_i += 1
             clock = time.time()
+    static = set()
+    sample = []
+    for tid, ms in motion.items():
+        if len(ms) < 2 or ms[-1][0] - ms[0][0] < STATIC_MIN_S:
+            continue
+        sp = [np.hypot(b[1] - a[1], b[2] - a[2]) / ((a[3] + b[3]) / 2) / max(0.1, b[0] - a[0])
+              for a, b in zip(ms, ms[1:]) if b[0] - a[0] <= 3.0]
+        if len(sp) >= 10 and float(np.percentile(sp, 75)) < STATIC_SPEED:
+            static.add(tid)
+            if len(sample) < 300:      # pour la verification a l'oeil
+                sample.append([round(ms[0][0], 1), round(ms[-1][0], 1), round(ms[0][4], 3), round(ms[0][5], 3)])
+    timings.update(static_tracks=len(static), static_sample=sample)
     timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
                    yolo_s=round(t_yolo, 1), tracker_s=round(t_detect - t_yolo, 1), track_fps=fps_out * ratio,
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
                    numbers_read=sum(sum(c.values()) for c in votes.values()))
-    return raw, votes
+    return raw, votes, static
 
 
 def play_windows(inp, start, end):
@@ -1228,7 +1271,7 @@ def process(inp):
         timings["camera_s"] = round(time.time() - clock, 1)
     clock = time.time()
     worker = PitchWorker(camera, L, W, windows, tmp or url, fps_out) if camera is not None else None
-    raw, votes = track(tmp or url, windows, fps_out, timings)
+    raw, votes, static = track(tmp or url, windows, fps_out, timings)
     expected = int(sum(we - ws for ws, we in windows) * fps_out) + len(windows)
     # Lecture directe interrompue (coupure reseau) : on recommence a partir
     # d'une copie complete de la video pour ne rien perdre.
@@ -1241,7 +1284,7 @@ def process(inp):
         if worker:
             worker.finish()
             worker = PitchWorker(camera, L, W, windows, tmp, fps_out)
-        raw, votes = track(tmp or url, windows, fps_out, timings)
+        raw, votes, static = track(tmp or url, windows, fps_out, timings)
     timings["tracking_s"] = round(time.time() - clock, 1)
     timings["video_decoder"] = _DECODER_OK.get("used", "cv2")
     per_frame_H, pitch_info = {}, None
@@ -1288,6 +1331,8 @@ def process(inp):
         cal_flags.append(Hf is not None or H is not None)
 
     if TRACKER == "v2":
+        # personnes immobiles (bancs, public) retirees avant le recollage
+        placed = [(t, [p for p in pts if p[0] not in static]) for t, pts in placed]
         placed, stitch = stitch_tracks(placed, cal_flags)
         timings["tracks_before_stitch"] = stitch["before"]
         timings["tracks_after_stitch"] = stitch["after"]
