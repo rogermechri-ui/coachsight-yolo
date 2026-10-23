@@ -621,7 +621,7 @@ def track(source, windows, fps_out, timings):
     la conversion en metres se fait ensuite (calage du terrain si fourni).
     pitch : PitchWorker optionnel, alimente avec les images (analysees et
     intermediaires) pour caler le terrain image par image."""
-    raw = []      # (t, [(trackId, u, v, ball, color)])
+    raw = []      # (t, [(trackId, u, v, ball, color, box)]) ; box = [x1, y1, x2, y2] image 0..1
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
@@ -712,7 +712,8 @@ def track(source, windows, fps_out, timings):
                         t_ocr += time.time() - c
                         if n is not None:
                             votes.setdefault(tid_i, Counter()).update([n])
-                    pts.append((tid_i, cx / w, cy / h, ball, col))
+                    bx = [round(box[0] / w, 4), round(box[1] / h, 4), round(box[2] / w, 4), round(box[3] / h, 4)]
+                    pts.append((tid_i, cx / w, cy / h, ball, col, bx))
             raw.append((round(t, 2), pts))
             frame_i += 1
             clock = time.time()
@@ -883,7 +884,7 @@ def stitch_tracks(placed, cal_flags, max_gap_s=TRACK_STITCH_S, speed=8.0, slack=
     info = {}
     for i, (t, pts) in enumerate(placed):
         cal = bool(cal_flags[i]) if i < len(cal_flags) else False
-        for tid, x, y, ball, col in pts:
+        for tid, x, y, ball, col, *rest in pts:
             if ball or tid < 0:
                 continue
             d = info.get(tid)
@@ -944,7 +945,7 @@ def drop_off_pitch(placed, cal_flags, L, W, depth_m=OFF_PITCH_DEPTH_M, min_pts=6
     for i, (t, pts) in enumerate(placed):
         if i >= len(cal_flags) or not cal_flags[i]:
             continue
-        for tid, x, y, ball, col in pts:
+        for tid, x, y, ball, col, *rest in pts:
             if not ball and tid >= 0:
                 pos.setdefault(tid, []).append((x, y))
     off = set()
@@ -983,7 +984,7 @@ def teams_whole_match(placed):
     # Equipe de chaque piste : vote sur toutes ses images.
     team_votes = {}
     for _, pts in placed:
-        for tid, x, y, ball, col in pts:
+        for tid, x, y, ball, col, *rest in pts:
             if not ball and tid >= 0 and col is not None:
                 team_votes.setdefault(tid, Counter())[color_team(col)] += 1
     track_team = {tid: c.most_common(1)[0][0] for tid, c in team_votes.items()}
@@ -1002,7 +1003,7 @@ def teams_by_window(placed, window_s=TEAM_WINDOW_S):
     per = {}
     for t, pts in placed:
         w = int(t // window_s)
-        for tid, x, y, ball, col in pts:
+        for tid, x, y, ball, col, *rest in pts:
             if ball or tid < 0 or col is None:
                 continue
             per.setdefault((tid, w), []).append(col)
@@ -1316,7 +1317,7 @@ def process(inp):
     for i, (tt, pts) in enumerate(raw):
         Hf = per_frame_H.get(i, (None, None))[0]
         keep = []
-        for tid, u, v, ball, col in pts:
+        for tid, u, v, ball, col, *rest in pts:
             if Hf is not None:
                 xy = pitch_track.image_to_pitch(Hf, u, v, *worker.size)
                 if xy is None:
@@ -1326,7 +1327,7 @@ def process(inp):
                 x, y = to_pitch(H, u, v, L, W)
             if (Hf is not None or H is not None) and not (-margin <= x <= L + margin and -margin <= y <= W + margin):
                 continue
-            keep.append((tid, x, y, ball, col))
+            keep.append((tid, x, y, ball, col) + tuple(rest[:1]))
         placed.append((tt, keep))
         cal_flags.append(Hf is not None or H is not None)
 
@@ -1370,15 +1371,20 @@ def process(inp):
     frames = []
     for i, ((tt, pts), cal) in enumerate(zip(placed, cal_flags)):
         out = []
-        for tid, x, y, ball, col in pts:
+        for tid, x, y, ball, col, *rest in pts:
             team = track_team.get(tid) if tid >= 0 else color_team(col)
             num = None if ball else numbers.get(tid)
-            out.append({
+            pt = {
                 "trackId": tid, "team": team,
                 "x": round(float(x), 2), "y": round(float(y), 2),
                 "ball": ball,
                 "number": num,
-            })
+            }
+            if rest and rest[0] is not None:
+                # cadre du joueur dans l'image (0..1, video entiere) : le site
+                # entoure le joueur sur la video quand on clique sur son point
+                pt["box"] = rest[0]
+            out.append(pt)
             if not ball and tid >= 0 and tid not in seen:
                 seen[tid] = True
                 tracks.append({"track_id": tid, "team": team, "number": num})
