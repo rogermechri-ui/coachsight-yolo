@@ -19,6 +19,7 @@ from ultralytics import YOLO
 
 import pitch_fit
 import pitch_track
+import actors
 
 try:
     import pytesseract
@@ -1953,8 +1954,13 @@ def handler(job):
                 return {"status": "export_ready", "result": export_clips(inp)}
             except Exception as e:
                 return {"status": "export_failed", "error": str(e)[:900]}
+        if inp.get("task") == "actor_crops":
+            try:
+                return {"status": "actor_crops_ready", "result": actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ)}
+            except Exception as e:
+                return {"status": "actor_crops_failed", "error": str(e)[:900]}
         if inp.get("task"):
-            return {"status": "failed", "error": "direct test supports the default analysis, prepare and export_clips only"}
+            return {"status": "failed", "error": "direct test supports the default analysis, prepare, export_clips and actor_crops only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
@@ -1981,6 +1987,14 @@ def handler(job):
             cb.update(status="export_ready", result=export_clips(inp))
         except Exception as e:
             cb.update(status="export_failed", error=str(e)[:900])
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
+    if inp.get("task") == "actor_crops":
+        # Vignettes des joueurs autour de chaque action (identification du joueur par l'application).
+        try:
+            cb.update(status="actor_crops_ready", result=actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ))
+        except Exception as e:
+            cb.update(status="actor_crops_failed", error=str(e)[:900])
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "prepare":
