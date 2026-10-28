@@ -35,6 +35,16 @@ import requests
 # consideree comme un joueur de cette equipe (arbitre, staff, chasuble, public).
 TEAM_MAX_DIST = float(os.environ.get("ACTOR_TEAM_MAX_DIST", "0.45"))
 
+# Part maximale de pixels du torse qui ressemblent a l'AUTRE equipe. Une boite qui
+# recouvre un joueur bleu ET son voisin blanc donnait un percentile de clarte
+# "blanc" : un joueur bleu etait propose pour une action des blancs (essai
+# Brevard / Centre du 27 oct. 2026). Au-dela de ce seuil, la boite est ambigue :
+# on l'ecarte plutot que de proposer un joueur de l'adversaire.
+OPPOSITE_MAX = float(os.environ.get("ACTOR_OPPOSITE_MAX", "0.2"))
+GRASS_HUE_MIN = int(os.environ.get("GRASS_HUE_MIN", "34"))
+# Un candidat doit etre a moins de N fois sa hauteur du ballon.
+NEAR_BALL_FACTOR = float(os.environ.get("ACTOR_NEAR_BALL_FACTOR", "2.5"))
+
 
 def _hex_to_lab(h):
     h = h.strip().lstrip("#")
@@ -76,6 +86,30 @@ def _classify(col, refs):
         if best is None or d < best[1]:
             best = (name, d)
     return best
+
+
+def _opposite_share(frame, box, refs, side):
+    """Part (0..1) des pixels du torse (hors pelouse) plus proches de l'equipe adverse."""
+    other = "theirs" if side == "ours" else "ours"
+    x1, y1, x2, y2 = [int(v) for v in box]
+    h, w = y2 - y1, x2 - x1
+    cx1, cx2 = x1 + int(w * 0.25), x2 - int(w * 0.25)
+    crop = frame[max(y1 + int(h * 0.18), 0):y1 + int(h * 0.48), max(cx1, 0):max(cx2, cx1 + 1)]
+    if crop.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    grass = (hsv[:, 0] >= GRASS_HUE_MIN) & (hsv[:, 0] <= 90) & (hsv[:, 1] > 50) & (hsv[:, 2] > 30)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)[~grass]
+    if len(lab) < 12:
+        return 0.0
+    if len(lab) > 200:
+        lab = lab[np.linspace(0, len(lab) - 1, 200).astype(int)]
+    n = 0
+    for c in lab:
+        name, d = _classify(c, refs)
+        if name == other and d <= TEAM_MAX_DIST:
+            n += 1
+    return n / len(lab)
 
 
 def _draw_context(frame, picks, width):
@@ -152,6 +186,8 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                         name, dist = _classify(col, refs)
                         if name != side or dist > TEAM_MAX_DIST:
                             continue          # autre equipe, arbitre, staff, chasuble
+                        if _opposite_share(frame, box, refs, side) > OPPOSITE_MAX:
+                            continue          # boite melangee (joueur adverse a cote) : ambigu
                         bh = box[3] - box[1]
                         if bh < 24:
                             continue          # trop petit : un numero y est illisible
@@ -164,6 +200,13 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                     persons.sort(key=lambda p: p["ball_distance_px"])
                 else:
                     persons.sort(key=lambda p: -p["height_px"])
+                # Sans ballon vu, ou trop loin du ballon (spectateur, remplacant, staff),
+                # aucun candidat n'est propose : mieux vaut laisser vide que se tromper.
+                if not ball:
+                    persons = []
+                else:
+                    persons = [p for p in persons
+                               if p["ball_distance_px"] is not None and p["ball_distance_px"] < NEAR_BALL_FACTOR * p["height_px"]]
                 picks = persons[:max_players]
                 for k, p in enumerate(picks):
                     p["label"] = chr(ord("A") + k)
