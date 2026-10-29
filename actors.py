@@ -49,6 +49,9 @@ OPPOSITE_MAX = float(os.environ.get("ACTOR_OPPOSITE_MAX", "0.2"))
 GRASS_HUE_MIN = int(os.environ.get("GRASS_HUE_MIN", "34"))
 # Un candidat doit etre a moins de N fois sa hauteur du ballon.
 NEAR_BALL_FACTOR = float(os.environ.get("ACTOR_NEAR_BALL_FACTOR", "2.5"))
+# Part minimale de pelouse sous les pieds pour etre « sur le terrain » (cameraman
+# derriere la ligne, banc, public derriere la barriere : pas de pelouse sous eux).
+ON_PITCH_MIN = float(os.environ.get("ACTOR_ON_PITCH_MIN", "0.3"))
 
 
 def _hex_to_lab(h):
@@ -115,6 +118,19 @@ def _opposite_share(frame, box, refs, side):
         if name == other and d <= TEAM_MAX_DIST:
             n += 1
     return n / len(lab)
+
+
+def _grass_under_feet(frame, box):
+    """Part (0..1) de pelouse dans une bande juste sous les pieds du joueur."""
+    H, W = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    h = max(1, y2 - y1)
+    strip = frame[min(H - 1, y2):min(H, y2 + max(3, int(0.12 * h))), max(0, x1):min(W, x2)]
+    if strip.size == 0:
+        return 1.0                      # bord d'image : on ne peut pas juger, on garde
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    grass = (hsv[:, 0] >= GRASS_HUE_MIN) & (hsv[:, 0] <= 90) & (hsv[:, 1] > 50) & (hsv[:, 2] > 30)
+    return float(grass.mean())
 
 
 def _draw_context(frame, picks, width):
@@ -201,7 +217,12 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                         continue          # autre equipe
                     if _opposite_share(frame, box, refs, side) > OPPOSITE_MAX:
                         continue          # boite melangee (joueur adverse a cote) : ambigu
-                    persons.append({"box_px": box, "height_px": round(bh), "team_distance": round(dist, 3), "feet": feet})
+                    persons.append({"box_px": box, "height_px": round(bh), "team_distance": round(dist, 3), "feet": feet,
+                                    "grass": _grass_under_feet(frame, box)})
+                # Hors terrain (cameraman, banc, public) : ecartes, sauf s'il ne resterait personne.
+                on_pitch = [p for p in persons if p["grass"] >= ON_PITCH_MIN]
+                if on_pitch:
+                    persons = on_pitch
                 raw.append({"t": t, "frame": frame, "w": w, "h": h, "persons": persons, "ball": ball, "feet_all": feet_all})
 
             # 2e passage : choix des candidats. Depuis que c'est le coach qui designe
@@ -272,7 +293,8 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                     players.append({"label": p["label"], "file": name,
                                     "box": [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)],
                                     "height_px": p["height_px"], "team_distance": p["team_distance"],
-                                    "near_ball": p["near_ball"], "ball_distance_px": p["ball_distance_px"]})
+                                    "near_ball": p["near_ball"], "ball_distance_px": p["ball_distance_px"],
+                                    "grass_under_feet": round(p["grass"], 2)})
                 frames_out.append({"t": round(t, 2), "context": ctx_name if ok2 else None,
                                    "ball_seen": bool(fr["ball"]), "ball_source": ball_source,
                                    "players": players})
