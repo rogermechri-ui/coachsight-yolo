@@ -20,6 +20,7 @@ from ultralytics import YOLO
 import pitch_fit
 import pitch_track
 import actors
+import hot
 
 try:
     import pytesseract
@@ -1420,12 +1421,24 @@ def process(inp):
     else:
         cal_frames = [f for f in frames if f["calibrated"]]
         tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
+    # Etape B (oublis de l'IA) : fenetres chaudes d'apres le suivi, et images
+    # denses dans ces fenetres si le site a fourni une adresse d'envoi.
+    # Jamais bloquant : sans adresse, seules les fenetres sont renvoyees.
+    clock = time.time()
+    try:
+        dense = hot.collect_dense_frames(tmp, frames, windows, inp, _grab_jpegs, workers=max(1, min(4, FRAMES_WORKERS)))
+    except Exception as e:
+        dense = {"hot_windows": [], "uploaded": False, "count": 0, "error": str(e)[:300]}
+    timings["dense_s"] = round(time.time() - clock, 1)
+    if dense.get("uploaded"):
+        notify(inp, status="frames_dense_ready", frames_dense_zip=dense, timings=dict(timings))
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
     # Trace dans les journaux RunPod (onglet Logs) : temps et calage de chaque analyse.
     print("ANALYSIS_SUMMARY " + json.dumps({"timings": timings, "pitch_calibration": calibration}), flush=True)
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
-            "frames_zip": frames_zip, "team_colors": team_colors, "play_windows": windows,
+            "frames_zip": frames_zip, "frames_dense_zip": dense, "hot_windows": dense.get("hot_windows", []),
+            "team_colors": team_colors, "play_windows": windows,
             "pitch_calibration": calibration, "tactical": tactical,
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
