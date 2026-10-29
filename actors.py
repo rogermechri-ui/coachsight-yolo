@@ -16,8 +16,13 @@ Entree (input) :
   upload_url           adresse signee ou deposer le zip (PUT)
 Sortie (result) : {"events": [{"id", "t", "frames": [{"t", "context", "players": [
   {"label": "A", "file", "box": [x1,y1,x2,y2] (0..1 de l'image entiere),
-   "height_px", "team_distance", "near_ball": bool, "ball_distance_px"}]}]}],
+   "height_px", "team_distance", "near_ball": bool, "ball_distance_px"}],
+  "ball_seen": bool, "ball_source": "frame" | "neighbour" | "none"}]}],
   "zip": {...}, "timings": {...}}
+Candidats : pres du ballon si le ballon est vu dans l'image ou dans une image
+voisine de l'action ; sinon les joueurs de l'equipe les plus proches du centre
+de l'action (near_ball=false). Il y a donc presque toujours des vignettes :
+c'est le coach qui choisit, un candidat de trop ne coute qu'un coup d'oeil.
 Le zip contient context_<event>_<t>.jpg (image reduite, joueurs candidats
 entoures et lettres A, B, C...) et crop_<event>_<t>_<lettre>.jpg (vignettes).
 """
@@ -158,6 +163,8 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
             t0 = float(ev["t"])
             side = "ours" if ev.get("team", "ours") == "ours" else "theirs"
             frames_out = []
+            # 1er passage : detections et ballon de chaque image de l'action.
+            raw = []
             for off in offsets:
                 t = max(0.0, t0 + off)
                 c = time.time()
@@ -170,47 +177,74 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                 c = time.time()
                 res = model.predict(frame, classes=[0, 32], conf=0.25, imgsz=imgsz, verbose=False)[0]
                 t_detect += time.time() - c
-                persons, ball = [], None
+                persons, ball, feet_all = [], None, []
                 boxes = list(zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist(), res.boxes.conf.tolist())) if res.boxes is not None else []
                 balls = [(b, cf) for b, c, cf in boxes if int(c) == 32]
                 if balls:
                     b = max(balls, key=lambda x: x[1])[0]      # le ballon le plus sur
                     ball = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
-                if boxes:
-                    for box, cls, _ in boxes:
-                        if int(cls) == 32:
-                            continue
-                        col = shirt_color(frame, box)
-                        if col is None:
-                            continue
-                        name, dist = _classify(col, refs)
-                        if name != side or dist > TEAM_MAX_DIST:
-                            continue          # autre equipe, arbitre, staff, chasuble
-                        if _opposite_share(frame, box, refs, side) > OPPOSITE_MAX:
-                            continue          # boite melangee (joueur adverse a cote) : ambigu
-                        bh = box[3] - box[1]
-                        if bh < 24:
-                            continue          # trop petit : un numero y est illisible
-                        feet = ((box[0] + box[2]) / 2, box[3])
-                        bd = float(np.hypot(feet[0] - ball[0], feet[1] - ball[1])) if ball else None
-                        persons.append({"box_px": box, "height_px": round(bh), "team_distance": round(dist, 3),
-                                        "ball_distance_px": round(bd) if bd is not None else None})
-                # Les plus proches du ballon d'abord ; sans ballon, les plus grands (= les plus proches de la camera).
-                if ball:
-                    persons.sort(key=lambda p: p["ball_distance_px"])
-                else:
-                    persons.sort(key=lambda p: -p["height_px"])
-                # Sans ballon vu, ou trop loin du ballon (spectateur, remplacant, staff),
-                # aucun candidat n'est propose : mieux vaut laisser vide que se tromper.
+                for box, cls, _ in boxes:
+                    if int(cls) == 32:
+                        continue
+                    col = shirt_color(frame, box)
+                    if col is None:
+                        continue
+                    name, dist = _classify(col, refs)
+                    if dist > TEAM_MAX_DIST:
+                        continue          # arbitre, staff, chasuble, public
+                    bh = box[3] - box[1]
+                    if bh < 24:
+                        continue          # trop petit
+                    feet = ((box[0] + box[2]) / 2, box[3])
+                    feet_all.append(feet)  # joueurs des deux equipes : ou se joue l'action
+                    if name != side:
+                        continue          # autre equipe
+                    if _opposite_share(frame, box, refs, side) > OPPOSITE_MAX:
+                        continue          # boite melangee (joueur adverse a cote) : ambigu
+                    persons.append({"box_px": box, "height_px": round(bh), "team_distance": round(dist, 3), "feet": feet})
+                raw.append({"t": t, "frame": frame, "w": w, "h": h, "persons": persons, "ball": ball, "feet_all": feet_all})
+
+            # 2e passage : choix des candidats. Depuis que c'est le coach qui designe
+            # le joueur (plus de lecture de numero par l'IA), un candidat de trop
+            # coute un coup d'oeil, un candidat manquant oblige a chercher dans la
+            # video : on propose donc toujours quelque chose.
+            #   - ballon vu dans l'image : les joueurs pres du ballon ;
+            #   - sinon, ballon vu dans une image voisine de l'action (il bouge peu
+            #     en 1 s) : meme regle autour de cette position ;
+            #   - sinon, les joueurs les plus proches du centre de l'action (point
+            #     median des pieds de tous les joueurs vus), marques near_ball=false.
+            for fr in raw:
+                t, frame, w, h, persons = fr["t"], fr["frame"], fr["w"], fr["h"], fr["persons"]
+                ball, ball_source = fr["ball"], "frame"
                 if not ball:
-                    persons = []
+                    others = [o for o in raw if o["ball"] and o is not fr]
+                    if others:
+                        ball = min(others, key=lambda o: abs(o["t"] - t))["ball"]
+                        ball_source = "neighbour"
+                    else:
+                        ball_source = None
+                for p in persons:
+                    bd = float(np.hypot(p["feet"][0] - ball[0], p["feet"][1] - ball[1])) if ball else None
+                    p["ball_distance_px"] = round(bd) if bd is not None else None
+                if ball:
+                    near = [p for p in persons if p["ball_distance_px"] < NEAR_BALL_FACTOR * p["height_px"]]
+                    near.sort(key=lambda p: p["ball_distance_px"])
+                    picks = near[:max_players]
                 else:
-                    persons = [p for p in persons
-                               if p["ball_distance_px"] is not None and p["ball_distance_px"] < NEAR_BALL_FACTOR * p["height_px"]]
-                picks = persons[:max_players]
+                    picks = []
+                if not picks and persons:
+                    # repli : centre de l'action = mediane des pieds de tous les joueurs vus
+                    if fr["feet_all"]:
+                        cx = float(np.median([f[0] for f in fr["feet_all"]]))
+                        cy = float(np.median([f[1] for f in fr["feet_all"]]))
+                        persons.sort(key=lambda p: np.hypot(p["feet"][0] - cx, p["feet"][1] - cy))
+                    else:
+                        persons.sort(key=lambda p: -p["height_px"])
+                    picks = persons[:max_players]
+                    ball_source = ball_source or "none"
                 for k, p in enumerate(picks):
                     p["label"] = chr(ord("A") + k)
-                    p["near_ball"] = bool(ball) and p["ball_distance_px"] is not None and p["ball_distance_px"] < 2.5 * p["height_px"]
+                    p["near_ball"] = ball_source == "frame" and p["ball_distance_px"] is not None and p["ball_distance_px"] < 2.5 * p["height_px"]
                 tms = int(round(t * 1000))
                 ctx_name = "context_%s_%09d.jpg" % (eid, tms)
                 ok2, jpg = cv2.imencode(".jpg", _draw_context(frame, picks, ctx_w), [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -240,7 +274,8 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                                     "height_px": p["height_px"], "team_distance": p["team_distance"],
                                     "near_ball": p["near_ball"], "ball_distance_px": p["ball_distance_px"]})
                 frames_out.append({"t": round(t, 2), "context": ctx_name if ok2 else None,
-                                   "ball_seen": bool(ball), "players": players})
+                                   "ball_seen": bool(fr["ball"]), "ball_source": ball_source,
+                                   "players": players})
             out_events.append({"id": eid, "t": t0, "team": side, "frames": frames_out})
         manifest = {"events": out_events, "team_colors": colors, "offsets_s": offsets}
         zf.writestr("manifest.json", json.dumps(manifest))
