@@ -100,7 +100,8 @@ def hot_windows(frames, windows, share_max=HOT_SHARE_MAX, pad_s=HOT_PAD_S,
     if not act or play_s <= 0:
         return [], {"reason": "not enough tracking data", "seconds_scored": len(act)}
     vals = np.array(list(act.values()))
-    base_thr = float(np.percentile(vals, 100 * (1 - share_max)))
+    # Au moins le double du niveau habituel : sans vrai pic, pas de fenetre.
+    base_thr = max(float(np.percentile(vals, 100 * (1 - share_max))), 2.0 * float(np.median(vals)))
 
     def build(thr):
         hot_s = sorted(s for s, v in act.items() if v >= thr and v > 0)
