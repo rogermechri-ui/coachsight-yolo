@@ -1100,6 +1100,38 @@ def positions_plausible(pts):
     return max(xs) - min(xs) >= MIN_SPREAD_M or max(ys) - min(ys) >= MIN_SPREAD_M
 
 
+def ball_sightings(frames, max_dist_m=6.0):
+    """Second avis d'equipe (chantier 2) : a chaque image ou le ballon est vu,
+    l'equipe (groupe 0 ou 1) du joueur le plus proche du ballon, avec la
+    distance et le nombre de joueurs de chaque groupe a moins de `max_dist_m`.
+    L'application s'en sert pour verifier l'equipe d'un moment IA a quelques
+    secondes pres : le ballon n'est vu que dans une petite part des images,
+    une tolerance de +/- 5 s est donc attendue cote site. Positions dans les
+    unites des images (metres si calees), la distance est relative a la taille
+    du terrain quand l'image n'est pas calee : on ne renvoie alors pas de
+    distance en metres mais le rang reste utile."""
+    out = []
+    for f in frames:
+        balls = [p for p in f["points"] if p["ball"]]
+        if not balls:
+            continue
+        b = balls[0]
+        players = [p for p in f["points"] if not p["ball"] and p.get("team") in (0, 1)]
+        if not players:
+            continue
+        d = sorted(((float(np.hypot(p["x"] - b["x"], p["y"] - b["y"])), p["team"]) for p in players), key=lambda q: q[0])
+        nearest_d, nearest_team = d[0]
+        near0 = sum(1 for dist, tm in d if tm == 0 and dist <= max_dist_m)
+        near1 = sum(1 for dist, tm in d if tm == 1 and dist <= max_dist_m)
+        # Second joueur de l'autre equipe : un duel si les deux sont pres du ballon.
+        other = next((dist for dist, tm in d if tm != nearest_team), None)
+        out.append({"t": round(float(f["t"]), 2), "team": int(nearest_team),
+                    "dist": round(nearest_d, 1) if f.get("calibrated") else None,
+                    "contested": bool(f.get("calibrated") and other is not None and other <= nearest_d + 2.0 and other <= max_dist_m),
+                    "near": [near0, near1]})
+    return out
+
+
 def split_at_side_switch(frames, windows):
     """Les equipes changent de cote a la mi-temps. Une periode de plus de 50 min
     (match entier envoye d'un bloc) est coupee au moment ou l'ordre gauche/droite
@@ -1436,11 +1468,17 @@ def process(inp):
         notify(inp, status="frames_dense_ready", frames_dense_zip=dense, timings=dict(timings))
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
+    try:
+        sightings = ball_sightings(frames)
+    except Exception as e:                      # jamais bloquant
+        sightings = []
+        timings["ball_sightings_error"] = str(e)[:200]
     # Trace dans les journaux RunPod (onglet Logs) : temps et calage de chaque analyse.
     print("ANALYSIS_SUMMARY " + json.dumps({"timings": timings, "pitch_calibration": calibration}), flush=True)
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
             "frames_zip": frames_zip, "frames_dense_zip": dense, "hot_windows": dense.get("hot_windows", []),
             "team_colors": team_colors, "play_windows": windows,
+            "ball_sightings": sightings,
             "pitch_calibration": calibration, "tactical": tactical,
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
