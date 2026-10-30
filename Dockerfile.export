@@ -1,0 +1,10 @@
+# Moteur d'export de clips sans carte graphique (tache export_clips seulement).
+# Image legere : Python + ffmpeg (libx264) + police pour les cartons titre.
+# A construire sur RunPod avec « Dockerfile path = Dockerfile.export » sur un
+# endpoint CPU. Rien de YOLO, rien de CUDA.
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN pip install --no-cache-dir runpod requests
+COPY export.py handler_export.py ./
+CMD ["python", "-u", "handler_export.py"]
