@@ -20,6 +20,7 @@ from ultralytics import YOLO
 import pitch_fit
 import pitch_track
 import actors
+import ball as ballmod   # 'ball' est deja une variable locale du suivi
 import hot
 
 try:
@@ -627,6 +628,7 @@ def track(source, windows, fps_out, timings):
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
+    n_zoom = 0       # ballons trouves par la deuxieme passe (BALL_ZOOM)
     t_yolo = 0.0     # part du modele (preparation + reseau + tri) dans t_detect ; le reste = suivi
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
@@ -716,6 +718,15 @@ def track(source, windows, fps_out, timings):
                             votes.setdefault(tid_i, Counter()).update([n])
                     bx = [round(box[0] / w, 4), round(box[1] / h, 4), round(box[2] / w, 4), round(box[3] / h, 4)]
                     pts.append((tid_i, cx / w, cy / h, ball, col, bx))
+            if ballmod.BALL_ZOOM and not any(p[3] for p in pts):
+                # Deuxieme passe ballon a pleine resolution autour du bloc de joueurs.
+                c = time.time()
+                zb = ballmod.zoom_detect(MODEL, frame, [[p[5][0] * w, p[5][1] * h, p[5][2] * w, p[5][3] * h] for p in pts])
+                t_detect += time.time() - c
+                if zb is not None:
+                    n_zoom += 1
+                    bx = [round(zb[0] / w, 4), round(zb[1] / h, 4), round(zb[2] / w, 4), round(zb[3] / h, 4)]
+                    pts.append((-1, (zb[0] + zb[2]) / 2 / w, (zb[1] + zb[3]) / 2 / h, True, None, bx))
             raw.append((round(t, 2), pts))
             frame_i += 1
             clock = time.time()
@@ -731,7 +742,7 @@ def track(source, windows, fps_out, timings):
             if len(sample) < 300:      # pour la verification a l'oeil
                 sample.append([round(ms[0][0], 1), round(ms[-1][0], 1), round(ms[0][4], 3), round(ms[0][5], 3)])
     timings.update(static_tracks=len(static), static_sample=sample)
-    timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
+    timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1), ball_zoom_hits=n_zoom,
                    yolo_s=round(t_yolo, 1), tracker_s=round(t_detect - t_yolo, 1), track_fps=fps_out * ratio,
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
                    numbers_read=sum(sum(c.values()) for c in votes.values()))
@@ -1111,15 +1122,18 @@ def ball_sightings(frames, max_dist_m=6.0):
     du terrain quand l'image n'est pas calee : on ne renvoie alors pas de
     distance en metres mais le rang reste utile."""
     out = []
+    # Vues reelles + positions interpolees entre deux vues proches (ball.py) :
+    # `seen` dit au site si le ballon etait vraiment dans l'image.
+    track = {t: (x, y, seen) for t, x, y, seen in ballmod.interpolate(frames)}
     for f in frames:
-        balls = [p for p in f["points"] if p["ball"]]
-        if not balls:
+        b = track.get(float(f["t"]))
+        if b is None:
             continue
-        b = balls[0]
+        bx, by, seen = b
         players = [p for p in f["points"] if not p["ball"] and p.get("team") in (0, 1)]
         if not players:
             continue
-        d = sorted(((float(np.hypot(p["x"] - b["x"], p["y"] - b["y"])), p["team"]) for p in players), key=lambda q: q[0])
+        d = sorted(((float(np.hypot(p["x"] - bx, p["y"] - by)), p["team"]) for p in players), key=lambda q: q[0])
         nearest_d, nearest_team = d[0]
         near0 = sum(1 for dist, tm in d if tm == 0 and dist <= max_dist_m)
         near1 = sum(1 for dist, tm in d if tm == 1 and dist <= max_dist_m)
@@ -1128,7 +1142,7 @@ def ball_sightings(frames, max_dist_m=6.0):
         out.append({"t": round(float(f["t"]), 2), "team": int(nearest_team),
                     "dist": round(nearest_d, 1) if f.get("calibrated") else None,
                     "contested": bool(f.get("calibrated") and other is not None and other <= nearest_d + 2.0 and other <= max_dist_m),
-                    "near": [near0, near1]})
+                    "near": [near0, near1], "seen": bool(seen)})
     return out
 
 
