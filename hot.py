@@ -16,7 +16,7 @@ envoye a cette adresse. Les instants deja couverts par l'echantillonnage de
 base ne sont pas renvoyes.
 
 Reglages (input ou variables d'environnement) :
-  frames_dense_every_s   intervalle dans les fenetres chaudes (defaut 1 s)
+  frames_dense_every_s   intervalle dans les fenetres chaudes (defaut 2 s)
   hot_share_max          part maximale du temps de jeu marquee chaude (0.35)
   hot_pad_s              marge ajoutee avant/apres chaque fenetre (4 s)
 """
@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 
-DENSE_EVERY_S = float(os.environ.get("FRAMES_DENSE_EVERY_S", "1"))
+DENSE_EVERY_S = float(os.environ.get("FRAMES_DENSE_EVERY_S", "2"))
 HOT_SHARE_MAX = float(os.environ.get("HOT_SHARE_MAX", "0.35"))
 HOT_PAD_S = float(os.environ.get("HOT_PAD_S", "4"))
 HOT_MIN_LEN_S = float(os.environ.get("HOT_MIN_LEN_S", "6"))
