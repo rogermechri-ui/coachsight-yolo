@@ -1308,8 +1308,8 @@ def process(inp):
                       "global_searches": st.get("global_searches", 0), "relocks": st.get("relocks", 0),
                       "motion_failed": st.get("motion_failed", 0), "error": worker.error}
     cap.release()
-    if tmp:
-        os.remove(tmp)
+    # La copie locale de la video est gardee jusqu'au passage dense (etape B),
+    # qui relit des images dans les fenetres chaudes ; elle est supprimee plus bas.
 
     # Positions en metres ; avec calage, tout ce qui est hors du terrain
     # (public, bancs, arbitres de touche) est ecarte.
@@ -1430,6 +1430,8 @@ def process(inp):
     except Exception as e:
         dense = {"hot_windows": [], "uploaded": False, "count": 0, "error": str(e)[:300]}
     timings["dense_s"] = round(time.time() - clock, 1)
+    if tmp and os.path.exists(tmp):
+        os.remove(tmp)
     if dense.get("uploaded"):
         notify(inp, status="frames_dense_ready", frames_dense_zip=dense, timings=dict(timings))
     timings["total_s"] = round(time.time() - job_clock, 1)

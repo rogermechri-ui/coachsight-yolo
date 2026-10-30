@@ -194,6 +194,9 @@ def collect_dense_frames(source, frames, windows, inp, grab_jpegs, workers=4):
         parts = [times[i:i + size] for i in range(0, len(times), size)]
         with ThreadPoolExecutor(max_workers=len(parts)) as pool:
             results = list(pool.map(lambda p: grab_jpegs(source, p, width, quality), parts))
+        if not any(results):
+            out["reason"] = "no frame could be read from the video"
+            return out
         buf = io.BytesIO()
         index = []
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
