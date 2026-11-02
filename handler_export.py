@@ -17,6 +17,7 @@ import requests
 import runpod
 
 import export
+import hls
 
 STARTED = time.time()
 
@@ -24,8 +25,10 @@ STARTED = time.time()
 def handler(event):
     inp = event.get("input") or {}
     task = inp.get("task")
+    if task == "hls":
+        return _run(inp, "hls", hls.build_hls)
     if task != "export_clips":
-        msg = "export engine: unsupported task %r (only export_clips)" % task
+        msg = "export engine: unsupported task %r (only export_clips, hls)" % task
         if inp.get("callback_url"):
             requests.post(inp["callback_url"], json={"job_id": inp.get("job_id"), "callback_token": inp.get("callback_token"),
                                                      "status": "unsupported", "error": msg}, timeout=60)
@@ -37,6 +40,19 @@ def handler(event):
         cb.update(status="export_ready", result=export.export_clips(inp))
     except Exception as e:
         cb.update(status="export_failed", error=str(e)[:900])
+    requests.post(inp["callback_url"], json=cb, timeout=120)
+    return {"status": cb["status"]}
+
+
+def _run(inp, name, fn):
+    """Meme contrat que export_clips : direct (console) ou rappel `<name>_ready` / `<name>_failed`."""
+    if not inp.get("callback_url"):
+        return fn(inp)
+    cb = {"job_id": inp.get("job_id"), "callback_token": inp.get("callback_token"), "engine": "export-cpu"}
+    try:
+        cb.update(status=name + "_ready", result=fn(inp))
+    except Exception as e:
+        cb.update(status=name + "_failed", error=str(e)[:900])
     requests.post(inp["callback_url"], json=cb, timeout=120)
     return {"status": cb["status"]}
 
