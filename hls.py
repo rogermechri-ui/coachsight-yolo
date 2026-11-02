@@ -17,6 +17,7 @@ Entree :
                         fournit ceil(duree / segment_s) + 2. S'il en manque,
                         la tache echoue proprement avant l'envoi.
   keep_local       tests locaux : garde les fichiers et renvoie le dossier
+  test_duration_s  tests : ne traite que les N premieres secondes (mesure de vitesse)
 Sans adresses d'envoi : fabrication seule (mesure du temps), rien n'est envoye.
 
 La playlist cite les morceaux par leur nom seul (seg00000.ts) : le lecteur du
@@ -72,7 +73,8 @@ def build_hls(inp):
     net = (["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
            if str(src).startswith("http") else [])
     args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net,
-            "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+            "-i", src, *(["-t", str(float(inp["test_duration_s"]))] if inp.get("test_duration_s") else []),
+            "-map", "0:v:0", "-map", "0:a:0?",
             "-vf", "scale=-2:%d,fps=%d" % (height, fps),
             "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
@@ -93,7 +95,8 @@ def build_hls(inp):
            "duration_s": round(duration or 0, 1), "bytes": total,
            "avg_segment_kb": round(total / max(1, len(segs)) / 1024),
            "playlist": "index.m3u8", "segment_names": segs,
-           "timings": {"transcode_s": round(transcode_s, 1)}}
+           "timings": {"transcode_s": round(transcode_s, 1),
+                       "speed_x_realtime": round((float(inp.get("test_duration_s") or duration or 0)) / max(transcode_s, 0.1), 2)}}
     urls = inp.get("segment_upload_urls") or []
     if inp.get("playlist_upload_url") or urls:
         if len(urls) < len(segs):
