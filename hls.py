@@ -24,6 +24,7 @@ La playlist cite les morceaux par leur nom seul (seg00000.ts) : le lecteur du
 site remplace chaque nom par son adresse signee au moment de la lecture.
 """
 import concurrent.futures as cf
+import math
 import os
 import shutil
 import subprocess
@@ -68,6 +69,17 @@ def build_hls(inp):
     _, src_h, duration = _ffprobe_size(src)
     height = min(height, src_h) if src_h else height
     height -= height % 2
+    urls_in = inp.get("segment_upload_urls") or []
+    if urls_in or inp.get("playlist_upload_url"):
+        # Verification avant d'encoder (12 min perdues sinon) : assez d'adresses, toutes valides.
+        span = float(inp.get("test_duration_s") or duration or 0)
+        need = int(math.ceil(span / seg)) if span else len(urls_in)
+        bad = [i for i, u in enumerate(urls_in[:need]) if not (isinstance(u, str) and u.startswith("http"))]
+        if len(urls_in) < need or bad:
+            raise RuntimeError("upload URLs not usable: %d given for ~%d segments, %d missing/invalid (first: %s)"
+                               % (len(urls_in), need, len(bad), bad[:5]))
+        if not str(inp.get("playlist_upload_url") or "").startswith("http"):
+            raise RuntimeError("playlist_upload_url missing or invalid")
     work = tempfile.mkdtemp(prefix="hls_")
     gop = int(round(seg * fps))
     net = (["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
