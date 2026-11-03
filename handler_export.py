@@ -16,6 +16,7 @@ import time
 import requests
 import runpod
 
+import audio
 import export
 import hls
 
@@ -27,8 +28,10 @@ def handler(event):
     task = inp.get("task")
     if task == "hls":
         return _run(inp, "hls", hls.build_hls)
+    if task == "audio":
+        return _run(inp, "audio", audio.audio_energy)
     if task != "export_clips":
-        msg = "export engine: unsupported task %r (only export_clips, hls)" % task
+        msg = "export engine: unsupported task %r (only export_clips, hls, audio)" % task
         if inp.get("callback_url"):
             requests.post(inp["callback_url"], json={"job_id": inp.get("job_id"), "callback_token": inp.get("callback_token"),
                                                      "status": "unsupported", "error": msg}, timeout=60)
