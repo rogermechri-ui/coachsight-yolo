@@ -39,13 +39,29 @@ TYPES = ["goal", "shot", "big_chance", "save", "cross", "corner", "free_kick", "
          "duel", "tackle", "interception", "turnover", "counter_attack", "box_entry", "injury",
          "substitution", "none"]
 
-PROMPT = """You are a football (soccer) match analyst. The video is a %ds clip from a wide TV broadcast. \
-The moment of interest is around the middle of the clip (about second %.0f). \
-Say whether a notable action happens in the clip and describe it.
-%s
-Action types: %s. Use "none" if nothing notable happens (normal build-up play is "none").
-Answer with JSON only: {"action": true|false, "type": <one type>, "time_in_clip_s": <seconds from clip start, number>, \
-"team": "home"|"away"|"unknown", "confidence": <0..1>, "note": "<max 15 words>"}."""
+PROMPT = """You are a football (soccer) match analyst. The video is a %ds clip from a wide TV broadcast (players are small). \
+List the notable actions that happen in the clip, if any. %s
+Action types and how to recognise them:
+- goal: the ball enters the net, celebration follows.
+- shot: a player strikes the ball towards goal (on or off target, blocked).
+- save: the goalkeeper stops or deflects a shot.
+- big_chance: a clear scoring opportunity that is not converted (one-on-one, open goal, header from close range).
+- cross: a ball played from a wide area (near the touchline) into or towards the penalty area, usually in the air.
+- corner: the ball is played from the corner arc.
+- free_kick: play restarts with a kick from a fixed spot after a stoppage (players stand still, a player prepares to kick a ball placed on the ground).
+- penalty: a kick from the penalty spot.
+- foul: a clear contact or trip that stops play or makes a player fall; the referee may react.
+- duel: a close one-on-one contest for the ball (no foul).
+- aerial_duel: two players jump for a ball in the air.
+- tackle: a player slides or steps in to take the ball from an opponent.
+- interception: a player cuts out a pass.
+- turnover: a team clearly loses possession (bad pass, lost control).
+- counter_attack: a fast attack straight after winning the ball, many players running forward.
+- box_entry: the ball or a ball carrier enters the penalty area.
+- injury: a player stays down and receives treatment.
+- sub: substitution (players leaving or entering at the touchline, board held up).
+Do not list normal passing or build-up play. If nothing notable happens, return an empty list.
+Answer with JSON only: {"events":[{"type":"<one type>","time_in_clip_s":<seconds from clip start, number>,"team":"home"|"away"|"unknown","confidence":<0..1>,"note":"<max 15 words>"}]}."""
 
 
 def _price(model):
@@ -110,7 +126,7 @@ def clips_ai(inp):
     colors = ""
     if inp.get("home_colors") or inp.get("away_colors"):
         colors = 'Teams: "home" wears %s, "away" wears %s.' % (inp.get("home_colors") or "?", inp.get("away_colors") or "?")
-    prompt = PROMPT % (clip_s, clip_s / 2.0, colors, ", ".join(TYPES))
+    prompt = PROMPT % (clip_s, colors)
     work = tempfile.mkdtemp(prefix="clipsai_")
     budget = inp.get("thinking_budget", 0)
 
