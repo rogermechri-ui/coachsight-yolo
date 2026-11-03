@@ -19,6 +19,9 @@ from ultralytics import YOLO
 
 import pitch_fit
 import pitch_track
+import actors
+import ball as ballmod   # 'ball' est deja une variable locale du suivi
+import hot
 
 try:
     import pytesseract
@@ -625,6 +628,7 @@ def track(source, windows, fps_out, timings):
     votes = {}    # trackId -> numeros lus (vote majoritaire en fin de traitement)
     frame_i = 0
     t_read = t_detect = t_color = t_ocr = 0.0
+    n_zoom = 0       # ballons trouves par la deuxieme passe (BALL_ZOOM)
     t_yolo = 0.0     # part du modele (preparation + reseau + tri) dans t_detect ; le reste = suivi
     MODEL.predictor = None   # repart d'un suivi vierge (cas d'une 2e tentative)
     crop = None     # zone utile de l'image (sans les bandes noires), fixee a la 1re image
@@ -714,6 +718,15 @@ def track(source, windows, fps_out, timings):
                             votes.setdefault(tid_i, Counter()).update([n])
                     bx = [round(box[0] / w, 4), round(box[1] / h, 4), round(box[2] / w, 4), round(box[3] / h, 4)]
                     pts.append((tid_i, cx / w, cy / h, ball, col, bx))
+            if ballmod.BALL_ZOOM and not any(p[3] for p in pts):
+                # Deuxieme passe ballon a pleine resolution autour du bloc de joueurs.
+                c = time.time()
+                zb = ballmod.zoom_detect(MODEL, frame, [[p[5][0] * w, p[5][1] * h, p[5][2] * w, p[5][3] * h] for p in pts])
+                t_detect += time.time() - c
+                if zb is not None:
+                    n_zoom += 1
+                    bx = [round(zb[0] / w, 4), round(zb[1] / h, 4), round(zb[2] / w, 4), round(zb[3] / h, 4)]
+                    pts.append((-1, (zb[0] + zb[2]) / 2 / w, (zb[1] + zb[3]) / 2 / h, True, None, bx))
             raw.append((round(t, 2), pts))
             frame_i += 1
             clock = time.time()
@@ -729,7 +742,7 @@ def track(source, windows, fps_out, timings):
             if len(sample) < 300:      # pour la verification a l'oeil
                 sample.append([round(ms[0][0], 1), round(ms[-1][0], 1), round(ms[0][4], 3), round(ms[0][5], 3)])
     timings.update(static_tracks=len(static), static_sample=sample)
-    timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1),
+    timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1), ball_zoom_hits=n_zoom,
                    yolo_s=round(t_yolo, 1), tracker_s=round(t_detect - t_yolo, 1), track_fps=fps_out * ratio,
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
                    numbers_read=sum(sum(c.values()) for c in votes.values()))
@@ -1098,6 +1111,41 @@ def positions_plausible(pts):
     return max(xs) - min(xs) >= MIN_SPREAD_M or max(ys) - min(ys) >= MIN_SPREAD_M
 
 
+def ball_sightings(frames, max_dist_m=6.0):
+    """Second avis d'equipe (chantier 2) : a chaque image ou le ballon est vu,
+    l'equipe (groupe 0 ou 1) du joueur le plus proche du ballon, avec la
+    distance et le nombre de joueurs de chaque groupe a moins de `max_dist_m`.
+    L'application s'en sert pour verifier l'equipe d'un moment IA a quelques
+    secondes pres : le ballon n'est vu que dans une petite part des images,
+    une tolerance de +/- 5 s est donc attendue cote site. Positions dans les
+    unites des images (metres si calees), la distance est relative a la taille
+    du terrain quand l'image n'est pas calee : on ne renvoie alors pas de
+    distance en metres mais le rang reste utile."""
+    out = []
+    # Vues reelles + positions interpolees entre deux vues proches (ball.py) :
+    # `seen` dit au site si le ballon etait vraiment dans l'image.
+    track = {t: (x, y, seen) for t, x, y, seen in ballmod.interpolate(frames)}
+    for f in frames:
+        b = track.get(float(f["t"]))
+        if b is None:
+            continue
+        bx, by, seen = b
+        players = [p for p in f["points"] if not p["ball"] and p.get("team") in (0, 1)]
+        if not players:
+            continue
+        d = sorted(((float(np.hypot(p["x"] - bx, p["y"] - by)), p["team"]) for p in players), key=lambda q: q[0])
+        nearest_d, nearest_team = d[0]
+        near0 = sum(1 for dist, tm in d if tm == 0 and dist <= max_dist_m)
+        near1 = sum(1 for dist, tm in d if tm == 1 and dist <= max_dist_m)
+        # Second joueur de l'autre equipe : un duel si les deux sont pres du ballon.
+        other = next((dist for dist, tm in d if tm != nearest_team), None)
+        out.append({"t": round(float(f["t"]), 2), "team": int(nearest_team),
+                    "dist": round(nearest_d, 1) if f.get("calibrated") else None,
+                    "contested": bool(f.get("calibrated") and other is not None and other <= nearest_d + 2.0 and other <= max_dist_m),
+                    "near": [near0, near1], "seen": bool(seen)})
+    return out
+
+
 def split_at_side_switch(frames, windows):
     """Les equipes changent de cote a la mi-temps. Une periode de plus de 50 min
     (match entier envoye d'un bloc) est coupee au moment ou l'ordre gauche/droite
@@ -1306,8 +1354,8 @@ def process(inp):
                       "global_searches": st.get("global_searches", 0), "relocks": st.get("relocks", 0),
                       "motion_failed": st.get("motion_failed", 0), "error": worker.error}
     cap.release()
-    if tmp:
-        os.remove(tmp)
+    # La copie locale de la video est gardee jusqu'au passage dense (etape B),
+    # qui relit des images dans les fenetres chaudes ; elle est supprimee plus bas.
 
     # Positions en metres ; avec calage, tout ce qui est hors du terrain
     # (public, bancs, arbitres de touche) est ecarte.
@@ -1419,12 +1467,32 @@ def process(inp):
     else:
         cal_frames = [f for f in frames if f["calibrated"]]
         tactical = tactical_metrics(cal_frames, windows, L, W) if cal_frames else []
+    # Etape B (oublis de l'IA) : fenetres chaudes d'apres le suivi, et images
+    # denses dans ces fenetres si le site a fourni une adresse d'envoi.
+    # Jamais bloquant : sans adresse, seules les fenetres sont renvoyees.
+    clock = time.time()
+    try:
+        dense = hot.collect_dense_frames(tmp, frames, windows, inp, _grab_jpegs, workers=max(1, min(4, FRAMES_WORKERS)))
+    except Exception as e:
+        dense = {"hot_windows": [], "uploaded": False, "count": 0, "error": str(e)[:300]}
+    timings["dense_s"] = round(time.time() - clock, 1)
+    if tmp and os.path.exists(tmp):
+        os.remove(tmp)
+    if dense.get("uploaded"):
+        notify(inp, status="frames_dense_ready", frames_dense_zip=dense, timings=dict(timings))
     timings["total_s"] = round(time.time() - job_clock, 1)
     ball_frames = sum(1 for f in frames if any(p["ball"] for p in f["points"]))
+    try:
+        sightings = ball_sightings(frames)
+    except Exception as e:                      # jamais bloquant
+        sightings = []
+        timings["ball_sightings_error"] = str(e)[:200]
     # Trace dans les journaux RunPod (onglet Logs) : temps et calage de chaque analyse.
     print("ANALYSIS_SUMMARY " + json.dumps({"timings": timings, "pitch_calibration": calibration}), flush=True)
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
-            "frames_zip": frames_zip, "team_colors": team_colors, "play_windows": windows,
+            "frames_zip": frames_zip, "frames_dense_zip": dense, "hot_windows": dense.get("hot_windows", []),
+            "team_colors": team_colors, "play_windows": windows,
+            "ball_sightings": sightings,
             "pitch_calibration": calibration, "tactical": tactical,
             "ball_frames": ball_frames, "total_frames": len(frames), "timings": timings}
 
@@ -1654,19 +1722,7 @@ FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/
 PROXY_CQ = int(os.environ.get("PROXY_CQ", "22"))   # qualite NVENC (plus petit = meilleur) ; 28 effacait les lignes lointaines
 
 
-def _ffprobe_size(src):
-    """(largeur, hauteur, duree) par ffprobe, pour une source que OpenCV n'ouvre pas."""
-    import subprocess, json as _json
-    try:
-        r = subprocess.run([FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error", "-select_streams", "v:0",
-                            "-show_entries", "stream=width,height:format=duration", "-of", "json", src],
-                           capture_output=True, text=True, timeout=120)
-        d = _json.loads(r.stdout or "{}")
-        st = (d.get("streams") or [{}])[0]
-        return int(st.get("width") or 0), int(st.get("height") or 0), float((d.get("format") or {}).get("duration") or 0) or None
-    except Exception:
-        return 0, 0, None
-
+from export import _ffprobe_size  # noqa: E402  (ffprobe partage avec le moteur d'export)
 
 def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
     """Re-encode la video en plus petit (largeur `width`, `fps` images/s, sans son).
@@ -1776,114 +1832,10 @@ def prepare(inp):
             "duration_s": round(duration, 2) if duration else None, "timings": timings}
 
 
-EXPORT_HEIGHT = int(os.environ.get("EXPORT_HEIGHT", "720"))
-EXPORT_FPS = int(os.environ.get("EXPORT_FPS", "25"))
-EXPORT_CRF = int(os.environ.get("EXPORT_CRF", "23"))
-EXPORT_TITLE_S = float(os.environ.get("EXPORT_TITLE_S", "2"))
-EXPORT_MAX_CLIPS = int(os.environ.get("EXPORT_MAX_CLIPS", "60"))
-EXPORT_MAX_CLIP_S = float(os.environ.get("EXPORT_MAX_CLIP_S", "120"))
-EXPORT_FONT = os.environ.get("EXPORT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+from export import (EXPORT_HEIGHT, EXPORT_FPS, EXPORT_CRF, EXPORT_TITLE_S, EXPORT_MAX_CLIPS,  # noqa: E402
+                    EXPORT_MAX_CLIP_S, EXPORT_FONT)
 
-
-def _run_ffmpeg(args, what):
-    import subprocess
-    r = subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", *args],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError("%s: %s" % (what, r.stderr.strip()[-300:]))
-
-
-def _export_segment(src, start, dur, height, fps, crf, dst):
-    """Un clip, decoupe a l'image pres (re-encode), sans son, hauteur `height`.
-    -ss avant -i : ffmpeg ne lit que le passage utile, meme a distance (HTTP)."""
-    net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"] if src.startswith("http") else []
-    vf = "scale=-2:'min(%d,ih)',fps=%d,setsar=1" % (height, fps)
-    _run_ffmpeg([*net, "-ss", "%.3f" % max(0.0, start), "-i", src, "-t", "%.3f" % dur, "-map", "0:v:0",
-                 "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-                 "-pix_fmt", "yuv420p", "-video_track_timescale", "90000", dst], "clip")
-
-
-def _export_title(text, w, h, fps, crf, secs, dst):
-    """Carton titre : fond sombre, texte blanc centre (lignes separees par \\n)."""
-    txt = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w", encoding="utf-8")
-    txt.write(text)
-    txt.close()
-    size = max(18, int(h / 14))
-    draw = ("drawtext=fontfile=%s:textfile=%s:fontcolor=white:fontsize=%d:line_spacing=%d:"
-            "x=(w-text_w)/2:y=(h-text_h)/2" % (EXPORT_FONT, txt.name, size, size // 2))
-    try:
-        _run_ffmpeg(["-f", "lavfi", "-i", "color=c=0x111418:s=%dx%d:r=%d:d=%.2f" % (w, h, fps, secs),
-                     "-vf", draw + ",setsar=1", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-                     "-pix_fmt", "yuv420p", "-video_track_timescale", "90000", dst], "title")
-    finally:
-        os.remove(txt.name)
-
-
-def export_clips(inp):
-    """Fabrique un MP4 a partir d'un ou plusieurs clips de la video du match et
-    l'envoie a l'adresse signee `upload_url`.
-    Entree : video_url, clips = [{"start_s", "end_s", "title"?}], title_cards
-    (carton avant chaque clip, defaut non), height (defaut 720), upload_url.
-    Les clips sont mis bout a bout dans l'ordre donne."""
-    timings = {}
-    job_clock = time.time()
-    src = inp["video_url"]
-    clips = inp.get("clips") or []
-    if not clips:
-        raise RuntimeError("no clip to export")
-    if len(clips) > EXPORT_MAX_CLIPS:
-        raise RuntimeError("too many clips: %d (max %d)" % (len(clips), EXPORT_MAX_CLIPS))
-    height = int(inp.get("height", EXPORT_HEIGHT))
-    fps = int(inp.get("fps", EXPORT_FPS))
-    crf = int(inp.get("crf", EXPORT_CRF))
-    titles = bool(inp.get("title_cards"))
-    work = tempfile.mkdtemp(prefix="export_")
-    parts, done = [], []
-    try:
-        clock = time.time()
-        for i, c in enumerate(clips):
-            start, end = float(c["start_s"]), float(c["end_s"])
-            dur = end - start
-            if dur <= 0 or dur > EXPORT_MAX_CLIP_S:
-                raise RuntimeError("clip %d: bad window %.1f-%.1f s" % (i + 1, start, end))
-            seg = os.path.join(work, "c%03d.mp4" % i)
-            _export_segment(src, start, dur, height, fps, crf, seg)
-            if titles:
-                w, h, _ = _ffprobe_size(seg)
-                card = os.path.join(work, "t%03d.mp4" % i)
-                _export_title(c.get("title") or "%d:%02d" % (int(start // 60), int(start % 60)),
-                              w, h, fps, crf, EXPORT_TITLE_S, card)
-                parts.append(card)
-            parts.append(seg)
-            done.append({"start_s": start, "end_s": end})
-        timings["cut_s"] = round(time.time() - clock, 1)
-        out = os.path.join(work, "export.mp4")
-        if len(parts) == 1:
-            os.replace(parts[0], out)
-        else:
-            lst = os.path.join(work, "list.txt")
-            with open(lst, "w") as f:
-                f.write("".join("file '%s'\n" % p for p in parts))
-            _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", "-movflags", "+faststart", out], "concat")
-        w, h, duration = _ffprobe_size(out)
-        size = os.path.getsize(out)
-        clock = time.time()
-        if inp.get("upload_url"):
-            with open(out, "rb") as f:
-                r = requests.put(inp["upload_url"], data=f, timeout=1800,
-                                 headers={"Content-Type": "video/mp4", "x-upsert": "true"})
-            r.raise_for_status()
-            timings["upload_s"] = round(time.time() - clock, 1)
-        timings["total_s"] = round(time.time() - job_clock, 1)
-        result = {"task": "export_clips", "clips": len(done), "title_cards": titles, "width": w, "height": h,
-                  "duration_s": round(duration, 2) if duration else None, "bytes": size, "timings": timings}
-        if inp.get("keep_local"):          # tests locaux uniquement
-            result["path"] = out
-        return result
-    finally:
-        if not inp.get("keep_local"):
-            import shutil
-            shutil.rmtree(work, ignore_errors=True)
+from export import _run_ffmpeg, _export_segment, _export_title, export_clips  # noqa: E402,F401
 
 
 def notify(inp, **fields):
@@ -1953,8 +1905,13 @@ def handler(job):
                 return {"status": "export_ready", "result": export_clips(inp)}
             except Exception as e:
                 return {"status": "export_failed", "error": str(e)[:900]}
+        if inp.get("task") == "actor_crops":
+            try:
+                return {"status": "actor_crops_ready", "result": actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ)}
+            except Exception as e:
+                return {"status": "actor_crops_failed", "error": str(e)[:900]}
         if inp.get("task"):
-            return {"status": "failed", "error": "direct test supports the default analysis, prepare and export_clips only"}
+            return {"status": "failed", "error": "direct test supports the default analysis, prepare, export_clips and actor_crops only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
@@ -1981,6 +1938,14 @@ def handler(job):
             cb.update(status="export_ready", result=export_clips(inp))
         except Exception as e:
             cb.update(status="export_failed", error=str(e)[:900])
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
+    if inp.get("task") == "actor_crops":
+        # Vignettes des joueurs autour de chaque action (identification du joueur par l'application).
+        try:
+            cb.update(status="actor_crops_ready", result=actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ))
+        except Exception as e:
+            cb.update(status="actor_crops_failed", error=str(e)[:900])
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "prepare":
