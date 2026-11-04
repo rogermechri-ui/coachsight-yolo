@@ -10,7 +10,8 @@ Enchainement (tout sur le moteur d'export CPU) :
 Resultat : des moments PROPOSES (le coach confirme dans Review) ; rien n'est ecrit par le moteur.
 
 Entree :
-  video_url          adresse lisible (signee) de la video
+  video_url          adresse lisible (signee) de la video (ou segments_json_url)
+  segments_json_url  adresse signee d'un JSON {"segment_s":6,"urls":[...]} : lit la copie HLS (rapide)
   model              obligatoire (ex. "gemini-3.1-pro-preview"), aucun defaut cache
   play_windows       [[debut_s, fin_s], ...] periodes de jeu (sinon toute la video)
   n_candidates       defaut 250 ; nms_s defaut 6 ; clip_s defaut 6
@@ -26,15 +27,87 @@ Sortie : {task, model, n_candidates, n_clips, moments:[{t, type, team, confidenc
           dropped:{type, confidence, existing, merged}, usage{...}, timings}
 La cle Gemini est lue dans GEMINI_API_KEY (jamais dans l'entree ni le resultat).
 """
+import concurrent.futures as cf
+import os
+import shutil
+import subprocess
+import tempfile
 import time
+import urllib.request
+import json
 
 import audio
 import clipsai
+from export import FFMPEG
 
 DEFAULT_KEEP = ["goal", "shot", "big_chance", "save", "cross", "corner", "free_kick", "penalty", "foul",
                 "turnover", "tackle", "counter_attack", "aerial_duel"]
 # types lus par le modele -> codes de la bibliotheque d'actions du site
 CODE = {"sub": "substitution"}
+
+
+class HlsSource:
+    """Copie de visionnage HLS lue segment par segment (petits fichiers, reponse rapide partout, la
+    video d'origine met 8 a 40 s a repondre sur une zone jamais lue). `segments_json_url` : adresse
+    signee d'un JSON {"segment_s": 6, "urls": [adresse signee de seg00000.ts, seg00001.ts, ...]}."""
+
+    def __init__(self, segments_json_url, workers=8):
+        with urllib.request.urlopen(segments_json_url, timeout=60) as r:
+            j = json.loads(r.read())
+        self.seg_s = float(j.get("segment_s") or 6)
+        self.urls = j["urls"]
+        self.dir = tempfile.mkdtemp(prefix="hls_")
+        self.workers = workers
+
+    def path(self, i):
+        return os.path.join(self.dir, "seg%05d.ts" % i)
+
+    def _get(self, i):
+        p = self.path(i)
+        if os.path.exists(p):
+            return p
+        last = None
+        for _ in range(4):
+            try:
+                with urllib.request.urlopen(self.urls[i], timeout=60) as r:
+                    data = r.read()
+                open(p + ".part", "wb").write(data)
+                os.replace(p + ".part", p)
+                return p
+            except Exception as e:
+                last = e
+                time.sleep(2)
+        raise RuntimeError("segment %d: %s" % (i, str(last)[:120]))
+
+    def fetch_all(self):
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
+            list(ex.map(self._get, range(len(self.urls))))
+
+    def concat_all(self):
+        out = os.path.join(self.dir, "all.ts")
+        with open(out, "wb") as o:
+            for i in range(len(self.urls)):
+                with open(self._get(i), "rb") as f:
+                    shutil.copyfileobj(f, o)
+        return out
+
+    def cutter(self):
+        def cut(t, clip_s, out):
+            start = max(0.0, t - clip_s / 2.0)
+            i0 = int(start // self.seg_s)
+            i1 = min(len(self.urls) - 1, int((start + clip_s) // self.seg_s))
+            files = [self._get(i) for i in range(i0, i1 + 1)]
+            args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", "-i", "concat:" + "|".join(files),
+                    "-ss", "%.2f" % (start - i0 * self.seg_s), "-t", str(clip_s), "-an",
+                    "-vf", "scale=-2:480,fps=10", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                    "-movflags", "+faststart", out]
+            r = subprocess.run(args, capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(out):
+                raise RuntimeError("ffmpeg clip failed: " + (r.stderr or "")[-300:])
+        return cut
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def _median(v):
@@ -142,7 +215,24 @@ def sound_moments(inp):
     existing = inp.get("existing") or []
     dedup_s = float(inp.get("dedup_s") or 6)
 
-    au = audio.audio_energy({"video_url": inp["video_url"], "step_s": 1})
+    hls = HlsSource(inp["segments_json_url"]) if inp.get("segments_json_url") else None
+    try:
+        return _run(inp, hls, t0, n_cand, cap, clip_s, windows, keep, min_conf, existing, dedup_s)
+    finally:
+        if hls:
+            hls.close()
+
+
+def _run(inp, hls, t0, n_cand, cap, clip_s, windows, keep, min_conf, existing, dedup_s):
+    tm = {}
+    if hls:
+        t1 = time.time()
+        hls.fetch_all()
+        src = hls.concat_all()
+        tm["download_s"] = round(time.time() - t1, 1)
+    else:
+        src = inp["video_url"]
+    au = audio.audio_energy({"video_url": src, "step_s": 1})
     if not au.get("has_audio"):
         return {"task": "sound_moments", "has_audio": False, "moments": [], "n_candidates": 0, "n_clips": 0}
     step = float(au.get("step_s") or 1)
@@ -150,9 +240,10 @@ def sound_moments(inp):
     if not times:
         return {"task": "sound_moments", "has_audio": True, "moments": [], "n_candidates": 0, "n_clips": 0}
 
-    cl = clipsai.clips_ai({"video_url": inp["video_url"], "times": times, "clip_s": clip_s, "model": inp["model"],
+    cl = clipsai.clips_ai({"video_url": inp.get("video_url"), "times": times, "clip_s": clip_s, "model": inp["model"],
                            "thinking_budget": inp.get("thinking_budget", 128), "home_colors": inp.get("home_colors"),
-                           "away_colors": inp.get("away_colors"), "max_clips": cap, "workers": inp.get("workers") or 4})
+                           "away_colors": inp.get("away_colors"), "max_clips": cap, "workers": inp.get("workers") or 4},
+                          cutter=hls.cutter() if hls else None)
     moments, dropped = extract_moments(cl["clips"], clip_s, keep, min_conf, existing, dedup_s)
     home = bool(inp.get("home_colors") or inp.get("away_colors"))
     for m in moments:
@@ -160,5 +251,5 @@ def sound_moments(inp):
     return {"task": "sound_moments", "model": inp["model"], "has_audio": True, "n_candidates": len(times),
             "n_clips": cl["n"], "failed": cl["failed"], "moments": moments, "dropped": dropped,
             "usage": cl["usage"],
-            "timings": {"audio_s": (au.get("timings") or {}).get("analyse_s"), "clips_s": cl["timings"]["total_s"],
+            "timings": {**tm, "audio_s": (au.get("timings") or {}).get("analyse_s"), "clips_s": cl["timings"]["total_s"],
                         "total_s": round(time.time() - t0, 1)}}

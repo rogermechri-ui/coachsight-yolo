@@ -107,7 +107,7 @@ def _ask(key, model, mp4, prompt, thinking_budget):
     raise RuntimeError(last or "gemini call failed")
 
 
-def clips_ai(inp):
+def clips_ai(inp, cutter=None):
     t0 = time.time()
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -115,7 +115,7 @@ def clips_ai(inp):
     model = inp.get("model")
     if not model:
         raise RuntimeError("model is required")
-    src = inp["video_url"]
+    src = None if cutter else inp["video_url"]
     clip_s = int(inp.get("clip_s") or 6)
     times = [float(x) for x in (inp.get("times") or [])]
     cap = int(inp.get("max_clips") or 80)
@@ -133,7 +133,7 @@ def clips_ai(inp):
     def one(t):
         out = os.path.join(work, "c_%d.mp4" % int(t * 10))
         try:
-            _cut(src, t, clip_s, out)
+            (cutter or (lambda tt, cs, o: _cut(src, tt, cs, o)))(t, clip_s, out)
             mp4 = open(out, "rb").read()
             resp = _ask(key, model, mp4, prompt, budget)
             u = resp.get("usageMetadata") or {}
