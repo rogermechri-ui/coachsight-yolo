@@ -57,3 +57,12 @@ def test_extract_filters_merges_dedups():
 def test_team_mapping():
     assert sm._team("home", True) == "us" and sm._team("away", True) == "opp"
     assert sm._team("home", False) == "unknown"
+
+
+def test_extract_tolerates_odd_answers():
+    clips = [{"ok": True, "t": 100.0, "answer": [{"type": "shot", "time_in_clip_s": 3, "confidence": 0.9}]},
+             {"ok": True, "t": 200.0, "answer": "texte"},
+             {"ok": True, "t": 300.0, "answer": {"events": ["x", {"type": "save", "time_in_clip_s": 3, "confidence": 0.9}]}},
+             {"ok": True, "t": 400.0, "answer": None}]
+    out, _ = sm.extract_moments(clips, 6, {"shot", "save"}, 0.7, [], 6)
+    assert [m["type"] for m in out] == ["shot", "save"]

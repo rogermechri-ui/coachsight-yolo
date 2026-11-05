@@ -167,8 +167,11 @@ def extract_moments(clips, clip_s, keep, min_conf, existing, dedup_s):
     for c in clips:
         if not c.get("ok"):
             continue
-        evs = ((c.get("answer") or {}).get("events")) or []
+        ans = c.get("answer")
+        evs = ans if isinstance(ans, list) else ((ans or {}).get("events") if isinstance(ans, dict) else None) or []
         for e in evs:
+            if not isinstance(e, dict):
+                continue
             ty = CODE.get(e.get("type"), e.get("type"))
             if ty not in keep:
                 dropped["type"] += 1
