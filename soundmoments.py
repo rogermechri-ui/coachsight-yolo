@@ -23,6 +23,7 @@ Entree :
   existing           [{"t": secondes, "type": "..."}] moments deja connus, pour ne pas les redoubler
   dedup_s            defaut 6
   cand_offset, cand_limit  tranche des candidats (ordre chronologique) pour traiter en plusieurs fois ; deadline_s (1800)
+  result_upload_url  adresse signee d'envoi (PUT) : le resultat complet y est depose ; compact_output=true : la sortie RunPod n'a plus la liste
   max_clips          garde-fou de cout (defaut 300) ; workers (defaut 4)
 Sortie : {task, model, n_candidates, n_clips, moments:[{t, type, team, confidence, note, source:"clip"}],
           dropped:{type, confidence, existing, merged}, usage{...}, timings}
@@ -204,7 +205,32 @@ def extract_moments(clips, clip_s, keep, min_conf, existing, dedup_s):
     return out, dropped
 
 
+def _put_json(url, obj):
+    """Depose le resultat complet (JSON) a une adresse d'envoi signee : la console RunPod tronque l'affichage."""
+    data = json.dumps(obj).encode()
+    last = None
+    for k in range(4):
+        try:
+            req = urllib.request.Request(url, data=data, method="PUT",
+                                         headers={"Content-Type": "application/json", "x-upsert": "true"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status
+        except Exception as e:
+            last = e
+            time.sleep(3 * (k + 1))
+    return "upload failed: %s" % str(last)[:120]
+
+
 def sound_moments(inp):
+    res = _sound_moments(inp)
+    if inp.get("result_upload_url") and isinstance(res, dict):
+        res["result_upload"] = _put_json(inp["result_upload_url"], res)
+        if inp.get("compact_output"):
+            res = {k: v for k, v in res.items() if k != "moments"} | {"n_moments": len(res.get("moments") or [])}
+    return res
+
+
+def _sound_moments(inp):
     t0 = time.time()
     if not inp.get("model"):
         raise RuntimeError("model is required")
