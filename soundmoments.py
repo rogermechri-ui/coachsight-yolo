@@ -51,7 +51,7 @@ class HlsSource:
     video d'origine met 8 a 40 s a repondre sur une zone jamais lue). `segments_json_url` : adresse
     signee d'un JSON {"segment_s": 6, "urls": [adresse signee de seg00000.ts, seg00001.ts, ...]}."""
 
-    def __init__(self, segments_json_url, workers=8):
+    def __init__(self, segments_json_url, workers=4):
         with urllib.request.urlopen(segments_json_url, timeout=60) as r:
             j = json.loads(r.read())
         self.seg_s = float(j.get("segment_s") or 6)
@@ -67,16 +67,16 @@ class HlsSource:
         if os.path.exists(p):
             return p
         last = None
-        for _ in range(4):
+        for k in range(10):
             try:
                 with urllib.request.urlopen(self.urls[i], timeout=60) as r:
                     data = r.read()
                 open(p + ".part", "wb").write(data)
                 os.replace(p + ".part", p)
                 return p
-            except Exception as e:
+            except Exception as e:  # 429 (trop de demandes) : on attend de plus en plus longtemps
                 last = e
-                time.sleep(2)
+                time.sleep(min(30, 2 * (k + 1)))
         raise RuntimeError("segment %d: %s" % (i, str(last)[:120]))
 
     def fetch_all(self):
