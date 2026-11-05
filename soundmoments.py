@@ -278,12 +278,17 @@ def _run(inp, hls, t0, n_cand, cap, clip_s, windows, keep, min_conf, existing, d
                            "thinking_budget": inp.get("thinking_budget", 128), "home_colors": inp.get("home_colors"),
                            "away_colors": inp.get("away_colors"), "max_clips": cap, "workers": inp.get("workers") or 4},
                           cutter=hls.cutter() if hls else None)
+    errors = {}
+    for c in cl["clips"]:
+        if not c.get("ok"):
+            k = (c.get("error") or "?")[:160]
+            errors[k] = errors.get(k, 0) + 1
     moments, dropped = extract_moments(cl["clips"], clip_s, keep, min_conf, existing, dedup_s)
     home = bool(inp.get("home_colors") or inp.get("away_colors"))
     for m in moments:
         m["team"] = _team(m["team"], home)
     return {"task": "sound_moments", "model": inp["model"], "has_audio": True, "n_candidates": len(times),
-            "n_clips": cl["n"], "failed": cl["failed"], "moments": moments, "dropped": dropped,
+            "n_clips": cl["n"], "failed": cl["failed"], "errors": errors, "moments": moments, "dropped": dropped,
             "usage": cl["usage"],
             "timings": {**tm, "audio_s": (au.get("timings") or {}).get("analyse_s"), "clips_s": cl["timings"]["total_s"],
                         "total_s": round(time.time() - t0, 1)}}
