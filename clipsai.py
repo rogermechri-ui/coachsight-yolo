@@ -130,8 +130,13 @@ def clips_ai(inp, cutter=None):
     work = tempfile.mkdtemp(prefix="clipsai_")
     budget = inp.get("thinking_budget", 0)
 
+    deadline = t0 + float(inp.get("deadline_s") or 1800)
+    done = [0]
+
     def one(t):
         out = os.path.join(work, "c_%d.mp4" % int(t * 10))
+        if time.time() > deadline:
+            return {"t": t, "ok": False, "error": "deadline"}
         try:
             (cutter or (lambda tt, cs, o: _cut(src, tt, cs, o)))(t, clip_s, out)
             mp4 = open(out, "rb").read()
@@ -151,6 +156,9 @@ def clips_ai(inp, cutter=None):
         except Exception as e:
             return {"t": t, "ok": False, "error": str(e).replace(key, "***")[:300]}
         finally:
+            done[0] += 1
+            if done[0] % 10 == 0:
+                print("clips_ai progress %d/%d after %ds" % (done[0], len(times), time.time() - t0), flush=True)
             try:
                 os.remove(out)
             except OSError:

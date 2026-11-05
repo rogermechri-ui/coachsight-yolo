@@ -22,6 +22,7 @@ Entree :
   min_confidence     0..1 (defaut 0.7)
   existing           [{"t": secondes, "type": "..."}] moments deja connus, pour ne pas les redoubler
   dedup_s            defaut 6
+  cand_offset, cand_limit  tranche des candidats (ordre chronologique) pour traiter en plusieurs fois ; deadline_s (1800)
   max_clips          garde-fou de cout (defaut 300) ; workers (defaut 4)
 Sortie : {task, model, n_candidates, n_clips, moments:[{t, type, team, confidence, note, source:"clip"}],
           dropped:{type, confidence, existing, merged}, usage{...}, timings}
@@ -243,7 +244,11 @@ def _run(inp, hls, t0, n_cand, cap, clip_s, windows, keep, min_conf, existing, d
     if not times:
         return {"task": "sound_moments", "has_audio": True, "moments": [], "n_candidates": 0, "n_clips": 0}
 
-    cl = clipsai.clips_ai({"video_url": inp.get("video_url"), "times": times, "clip_s": clip_s, "model": inp["model"],
+    off = int(inp.get("cand_offset") or 0)
+    lim = int(inp.get("cand_limit") or len(times))
+    times = times[off:off + lim]
+    print("sound_moments: %d candidates in this run (offset %d), audio done after %ds" % (len(times), off, time.time() - t0), flush=True)
+    cl = clipsai.clips_ai({"video_url": inp.get("video_url"), "deadline_s": inp.get("deadline_s") or 1800, "times": times, "clip_s": clip_s, "model": inp["model"],
                            "thinking_budget": inp.get("thinking_budget", 128), "home_colors": inp.get("home_colors"),
                            "away_colors": inp.get("away_colors"), "max_clips": cap, "workers": inp.get("workers") or 4},
                           cutter=hls.cutter() if hls else None)
