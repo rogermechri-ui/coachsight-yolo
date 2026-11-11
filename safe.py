@@ -32,3 +32,112 @@ def scrub(text, limit=None):
     s = _PARAM.sub(r"\1=***", s)
     s = _JWT.sub("***", s)
     return s[:limit] if limit else s
+
+
+# --------------------------------------------------------------------------
+# Controle des adresses recues en entree (lot 2)
+# --------------------------------------------------------------------------
+# Le moteur telecharge, envoie et rappelle des adresses fournies dans la demande.
+# Sans controle, une demande malveillante pourrait lui faire lire un service
+# interne (adresse privee, metadonnees de l'hebergeur) ou un fichier local.
+# Regles : https uniquement, hote public, et (si ALLOWED_URL_HOSTS est renseigne)
+# hote dans la liste. URL_GUARD=off coupe le controle sans reconstruire l'image.
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
+FFMPEG_REMOTE_PROTOCOLS = "https,tls,tcp"
+FFMPEG_LOCAL_PROTOCOLS = "file"
+
+
+def _guard_on():
+    return (os.environ.get("URL_GUARD") or "enforce").strip().lower() != "off"
+
+
+def _allowed_hosts():
+    raw = os.environ.get("ALLOWED_URL_HOSTS") or ""
+    return [h.strip().lower().lstrip(".") for h in raw.split(",") if h.strip()]
+
+
+def _public_ip(ip):
+    a = ipaddress.ip_address(ip)
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return not (a.is_private or a.is_loopback or a.is_link_local or a.is_multicast
+                or a.is_reserved or a.is_unspecified)
+
+
+def url_problem(url, resolve=True):
+    """None si l'adresse est acceptable, sinon la raison du refus (sans l'adresse complete)."""
+    if not _guard_on():
+        return None
+    if not isinstance(url, str) or not url:
+        return "not a text address"
+    try:
+        p = urlsplit(url)
+        host = (p.hostname or "").lower()
+        p.port   # leve ValueError si le port est invalide
+    except ValueError:
+        return "malformed address"
+    if p.scheme != "https":
+        return "only https addresses are accepted"
+    if not host or p.username or p.password:
+        return "malformed address"
+    allowed = _allowed_hosts()
+    if allowed and not any(host == h or host.endswith("." + h) for h in allowed):
+        return "host %s is not in the allowed list" % host
+    try:
+        ips = [host] if _is_ip(host) else (
+            sorted({ai[4][0] for ai in socket.getaddrinfo(host, p.port or 443, proto=socket.IPPROTO_TCP)})
+            if resolve else [])
+    except OSError:
+        return "host %s cannot be resolved" % host
+    if any(not _public_ip(ip) for ip in ips):
+        return "host %s is not a public address" % host
+    return None
+
+
+def _is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def check_url(url, what="address"):
+    """Leve ValueError si l'adresse n'est pas acceptable."""
+    why = url_problem(url)
+    if why:
+        raise ValueError("%s refused: %s" % (what, why))
+    return url
+
+
+def check_inputs(inp):
+    """Controle toutes les adresses de la demande (champs *_url et *_urls).
+    Renvoie None si tout va bien, sinon un message d'erreur court."""
+    if not _guard_on() or not isinstance(inp, dict):
+        return None
+    for key, val in inp.items():
+        if not isinstance(key, str) or val in (None, ""):
+            continue
+        if key.endswith("_url"):
+            vals = [val]
+        elif key.endswith("_urls"):
+            vals = val if isinstance(val, (list, tuple)) else [val]
+        else:
+            continue
+        for v in vals:
+            why = url_problem(v)
+            if why:
+                return "input %s refused: %s" % (key, why)
+    return None
+
+
+def ffmpeg_protocols(src):
+    """Options ffmpeg a placer avant `-i src` : la lecture ne peut suivre que les
+    protocoles attendus (une video piegee ne peut pas faire ouvrir autre chose)."""
+    if not _guard_on():
+        return []
+    remote = str(src).startswith(("http://", "https://"))
+    return ["-protocol_whitelist", FFMPEG_REMOTE_PROTOCOLS if remote else FFMPEG_LOCAL_PROTOCOLS]

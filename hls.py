@@ -34,7 +34,7 @@ import time
 import requests
 
 from export import FFMPEG, _ffprobe_size
-from safe import scrub
+from safe import scrub, ffmpeg_protocols
 
 HLS_SEGMENT_S = float(os.environ.get("HLS_SEGMENT_S", "6"))
 HLS_HEIGHT = int(os.environ.get("HLS_HEIGHT", "720"))
@@ -85,7 +85,7 @@ def build_hls(inp):
     gop = int(round(seg * fps))
     net = (["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
            if str(src).startswith("http") else [])
-    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net,
+    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net, *ffmpeg_protocols(src),
             "-i", src, *(["-t", str(float(inp["test_duration_s"]))] if inp.get("test_duration_s") else []),
             "-map", "0:v:0", "-map", "0:a:0?",
             "-vf", "scale=-2:%d,fps=%d" % (height, fps),
