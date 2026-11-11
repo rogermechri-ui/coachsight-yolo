@@ -26,7 +26,7 @@ import tempfile
 import time
 
 from export import FFMPEG
-from safe import scrub
+from safe import scrub, ffmpeg_protocols
 
 FFPROBE = os.environ.get("FFPROBE", "ffprobe")
 
@@ -76,7 +76,7 @@ def audio_energy(inp):
         pre += ["-ss", str(float(inp["start_s"]))]
     net = (["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
            if str(src).startswith("http") else [])
-    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net, *pre, "-i", src,
+    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net, *pre, *ffmpeg_protocols(src), "-i", src,
             *(["-t", str(float(inp["test_duration_s"]))] if inp.get("test_duration_s") else []),
             "-vn", "-filter_complex", graph,
             "-map", "[oa]", "-f", "null", "-", "-map", "[ob]", "-f", "null", "-", "-map", "[oc]", "-f", "null", "-"]

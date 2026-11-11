@@ -13,7 +13,7 @@ import time
 
 import requests
 
-from safe import scrub
+from safe import scrub, ffmpeg_protocols
 
 FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg")
 
@@ -31,7 +31,8 @@ def _ffprobe_size(src):
     import subprocess, json as _json
     try:
         r = subprocess.run([FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error", "-select_streams", "v:0",
-                            "-show_entries", "stream=width,height:format=duration", "-of", "json", src],
+                            "-show_entries", "stream=width,height:format=duration", "-of", "json",
+                            *ffmpeg_protocols(src), src],
                            capture_output=True, text=True, timeout=120)
         d = _json.loads(r.stdout or "{}")
         st = (d.get("streams") or [{}])[0]
@@ -53,7 +54,7 @@ def _export_segment(src, start, dur, height, fps, crf, dst):
     -ss avant -i : ffmpeg ne lit que le passage utile, meme a distance (HTTP)."""
     net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"] if src.startswith("http") else []
     vf = "scale=-2:'min(%d,ih)',fps=%d,setsar=1" % (height, fps)
-    _run_ffmpeg([*net, "-ss", "%.3f" % max(0.0, start), "-i", src, "-t", "%.3f" % dur, "-map", "0:v:0",
+    _run_ffmpeg([*net, "-ss", "%.3f" % max(0.0, start), *ffmpeg_protocols(src), "-i", src, "-t", "%.3f" % dur, "-map", "0:v:0",
                  "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
                  "-pix_fmt", "yuv420p", "-video_track_timescale", "90000", dst], "clip")
 

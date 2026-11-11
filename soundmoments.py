@@ -41,7 +41,7 @@ import json
 import audio
 import clipsai
 from export import FFMPEG
-from safe import scrub
+from safe import scrub, check_url, ffmpeg_protocols
 
 DEFAULT_KEEP = ["goal", "shot", "big_chance", "save", "cross", "corner", "free_kick", "penalty", "foul",
                 "turnover", "tackle", "counter_attack", "aerial_duel"]
@@ -55,7 +55,7 @@ class HlsSource:
     signee d'un JSON {"segment_s": 6, "urls": [adresse signee de seg00000.ts, seg00001.ts, ...]}."""
 
     def __init__(self, segments_json_url, workers=4):
-        with urllib.request.urlopen(segments_json_url, timeout=60) as r:
+        with urllib.request.urlopen(check_url(segments_json_url, "segments list address"), timeout=60) as r:
             j = json.loads(r.read())
         self.seg_s = float(j.get("segment_s") or 6)
         self.urls = j["urls"]
@@ -70,6 +70,7 @@ class HlsSource:
         if os.path.exists(p):
             return p
         last = None
+        check_url(self.urls[i], "segment address")   # refus immediat, sans nouvelle tentative
         for k in range(10):
             try:
                 with urllib.request.urlopen(self.urls[i], timeout=60) as r:
@@ -100,7 +101,8 @@ class HlsSource:
             i0 = int(start // self.seg_s)
             i1 = min(len(self.urls) - 1, int((start + clip_s) // self.seg_s))
             files = [self._get(i) for i in range(i0, i1 + 1)]
-            args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", "-i", "concat:" + "|".join(files),
+            args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin",
+                    *(["-protocol_whitelist", "concat,file"] if ffmpeg_protocols("") else []), "-i", "concat:" + "|".join(files),
                     "-ss", "%.2f" % (start - i0 * self.seg_s), "-t", str(clip_s), "-an",
                     "-vf", "scale=-2:480,fps=10", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
                     "-movflags", "+faststart", out]
