@@ -29,6 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 
+from safe import scrub
+
 DENSE_EVERY_S = float(os.environ.get("FRAMES_DENSE_EVERY_S", "2"))
 HOT_SHARE_MAX = float(os.environ.get("HOT_SHARE_MAX", "0.35"))
 HOT_PAD_S = float(os.environ.get("HOT_PAD_S", "4"))
@@ -214,5 +216,5 @@ def collect_dense_frames(source, frames, windows, inp, grab_jpegs, workers=4):
         r.raise_for_status()
         out["uploaded"] = True
     except Exception as e:
-        out["error"] = str(e)[:300]
+        out["error"] = scrub(e, 300)
     return out

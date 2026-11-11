@@ -1,0 +1,27 @@
+name: tests
+
+# Lance les tests unitaires a chaque pull request vers staging ou main,
+# et a chaque envoi sur staging. Les tests ne chargent pas le modele YOLO :
+# on installe seulement les petites bibliotheques utiles (pas ultralytics/torch).
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install light dependencies
+        run: pip install numpy opencv-python-headless requests scipy pytest
+      - name: Run tests
+        run: python -m pytest -q

@@ -34,6 +34,7 @@ import time
 import requests
 
 from export import FFMPEG, _ffprobe_size
+from safe import scrub
 
 HLS_SEGMENT_S = float(os.environ.get("HLS_SEGMENT_S", "6"))
 HLS_HEIGHT = int(os.environ.get("HLS_HEIGHT", "720"))
@@ -51,9 +52,9 @@ def _put(url, path, content_type, tries=4):
                 r = requests.put(url, data=f, timeout=300, headers={"Content-Type": content_type, "x-upsert": "true"})
             if r.status_code < 300:
                 return
-            last = "HTTP %s %s" % (r.status_code, r.text[:200])
+            last = "HTTP %s %s" % (r.status_code, scrub(r.text, 200))
         except Exception as e:  # reseau : on reessaie
-            last = str(e)[:200]
+            last = scrub(e, 200)
         time.sleep(2 * (k + 1))
     raise RuntimeError("upload failed for %s: %s" % (os.path.basename(path), last))
 
@@ -99,7 +100,7 @@ def build_hls(inp):
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         shutil.rmtree(work, ignore_errors=True)
-        raise RuntimeError("ffmpeg hls failed: " + (r.stderr or "")[-600:])
+        raise RuntimeError("ffmpeg hls failed: " + scrub((r.stderr or "")[-600:]))
     transcode_s = time.time() - t0
     segs = sorted(f for f in os.listdir(work) if f.endswith(".ts"))
     total = sum(os.path.getsize(os.path.join(work, f)) for f in segs)

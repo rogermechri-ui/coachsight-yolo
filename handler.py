@@ -22,6 +22,7 @@ import pitch_track
 import actors
 import ball as ballmod   # 'ball' est deja une variable locale du suivi
 import hot
+from safe import scrub
 
 try:
     import pytesseract
@@ -224,7 +225,7 @@ class FrameCollector:
             r.raise_for_status()
             info["uploaded"] = True
         except Exception as e:
-            info["error"] = str(e)[:300]
+            info["error"] = scrub(e, 300)
         return info
 
 
@@ -338,7 +339,7 @@ def _ffmpeg_frames(source, start, end, fps, width, gpu):
             if len(buf) < n_bytes:            # fin de la video (ou erreur ffmpeg)
                 if k == 0:
                     err = p.stderr.read().decode(errors="replace").strip()
-                    raise RuntimeError("ffmpeg produced no frame: " + err[-300:])
+                    raise RuntimeError("ffmpeg produced no frame: " + scrub(err[-300:]))
                 break
             t = start + k / fps
             if t > end + 1e-6:
@@ -383,7 +384,7 @@ def read_frames(source, start, end, fps, width=None):
             first = next(gen)
         except Exception as e:
             if _DECODER_OK.get(mode) is None:
-                print("video decoder %s unavailable: %s" % (mode, str(e)[:200]), flush=True)
+                print("video decoder %s unavailable: %s" % (mode, scrub(e, 200)), flush=True)
             _DECODER_OK[mode] = False
             continue
         if _DECODER_OK.get(mode) is None:
@@ -500,7 +501,7 @@ def open_video(url, start):
                 why = "could not open link"
             cap.release()
         except Exception as e:
-            why = "error: %s" % str(e)[:120]
+            why = "error: %s" % scrub(e, 120)
         why += " (%.1f s)" % (time.time() - clock)
     tmp = download(url)
     return cv2.VideoCapture(tmp), tmp, "download", why
@@ -542,7 +543,7 @@ def _pitch_slice(camera, L, W, source, slices, fps_out, k, out):
                 if a - 1e-6 <= t <= b + 1e-6:      # les secondes d'avant ne servent qu'a demarrer
                     H[round(t, 2)] = (None if h is None else h.tolist(), s)
     except Exception as e:  # le calage ne doit jamais faire echouer l'analyse
-        err = "%s: %s" % (type(e).__name__, str(e)[:200])
+        err = "%s: %s" % (type(e).__name__, scrub(e, 200))
     st = dict(tracker.stats)
     st["wall_s"] = time.time() - t0
     out.put({"H": H, "size": size, "error": err, "stats": st})
@@ -1474,7 +1475,7 @@ def process(inp):
     try:
         dense = hot.collect_dense_frames(tmp, frames, windows, inp, _grab_jpegs, workers=max(1, min(4, FRAMES_WORKERS)))
     except Exception as e:
-        dense = {"hot_windows": [], "uploaded": False, "count": 0, "error": str(e)[:300]}
+        dense = {"hot_windows": [], "uploaded": False, "count": 0, "error": scrub(e, 300)}
     timings["dense_s"] = round(time.time() - clock, 1)
     if tmp and os.path.exists(tmp):
         os.remove(tmp)
@@ -1486,7 +1487,7 @@ def process(inp):
         sightings = ball_sightings(frames)
     except Exception as e:                      # jamais bloquant
         sightings = []
-        timings["ball_sightings_error"] = str(e)[:200]
+        timings["ball_sightings_error"] = scrub(e, 200)
     # Trace dans les journaux RunPod (onglet Logs) : temps et calage de chaque analyse.
     print("ANALYSIS_SUMMARY " + json.dumps({"timings": timings, "pitch_calibration": calibration}), flush=True)
     return {"simulated": False, "pitch": {"length": L, "width": W}, "tracks": tracks, "frames": frames,
@@ -1575,7 +1576,7 @@ def pitch_probe(inp):
             try:
                 kps = _roboflow_keypoints(img, model, key)
             except Exception as e:
-                item["error"] = "roboflow: %s" % str(e)[:200]
+                item["error"] = "roboflow: %s" % scrub(e, 200)
                 results.append(item)
                 continue
             good = [k for k in kps if k[3] >= min_conf and 0 <= k[0] < len(PITCH_KEYPOINTS)]
@@ -1672,7 +1673,7 @@ def label_batch(inp):
                             suggestions.append({"id": c, "u": round(x / fw, 4), "v": round(y / fh, 4),
                                                 "confidence": round(conf, 3)})
                 except Exception as e:
-                    err = str(e)[:200]
+                    err = scrub(e, 200)
             ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             name = "label_%09d.jpg" % int(round(t * 1000))
             zf.writestr(name, jpg.tobytes())
@@ -1746,7 +1747,7 @@ def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        err = r.stderr.strip()[-300:]
+        err = scrub(r.stderr.strip()[-300:])
         if "No space left" in err:
             raise RuntimeError("%s: %s" % (encoder, err))     # inutile de reessayer autrement
         if pre:     # le decodage GPU a echoue (carte, codec) : on reessaie sur le processeur
@@ -1791,7 +1792,7 @@ def prepare(inp):
             encoder = enc
             break
         except Exception as e:
-            errors.append(str(e)[:200])
+            errors.append(scrub(e, 200))
             if "No space left" in str(e):
                 break
     timings["encode_s"] = round(time.time() - clock, 1)
@@ -1899,29 +1900,29 @@ def handler(job):
             try:
                 return {"status": "proxy_ready", "result": prepare(inp)}
             except Exception as e:
-                return {"status": "proxy_failed", "error": str(e)[:900]}
+                return {"status": "proxy_failed", "error": scrub(e, 900)}
         if inp.get("task") == "export_clips":
             try:
                 return {"status": "export_ready", "result": export_clips(inp)}
             except Exception as e:
-                return {"status": "export_failed", "error": str(e)[:900]}
+                return {"status": "export_failed", "error": scrub(e, 900)}
         if inp.get("task") == "actor_crops":
             try:
                 return {"status": "actor_crops_ready", "result": actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ)}
             except Exception as e:
-                return {"status": "actor_crops_failed", "error": str(e)[:900]}
+                return {"status": "actor_crops_failed", "error": scrub(e, 900)}
         if inp.get("task"):
             return {"status": "failed", "error": "direct test supports the default analysis, prepare, export_clips and actor_crops only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
-            return {"status": "failed", "error": str(e)[:900]}
+            return {"status": "failed", "error": scrub(e, 900)}
     cb = {"job_id": inp["job_id"], "callback_token": inp["callback_token"]}
     if inp.get("task") == "label_batch":
         try:
             cb.update(status="label_batch_ready", result=label_batch(inp))
         except Exception as e:
-            cb.update(status="label_batch_failed", error=str(e)[:900])
+            cb.update(status="label_batch_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "pitch_probe":
@@ -1929,7 +1930,7 @@ def handler(job):
         try:
             cb.update(status="probe_ready", result=pitch_probe(inp))
         except Exception as e:
-            cb.update(status="probe_failed", error=str(e)[:900])
+            cb.update(status="probe_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "export_clips":
@@ -1937,7 +1938,7 @@ def handler(job):
         try:
             cb.update(status="export_ready", result=export_clips(inp))
         except Exception as e:
-            cb.update(status="export_failed", error=str(e)[:900])
+            cb.update(status="export_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "actor_crops":
@@ -1945,7 +1946,7 @@ def handler(job):
         try:
             cb.update(status="actor_crops_ready", result=actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ))
         except Exception as e:
-            cb.update(status="actor_crops_failed", error=str(e)[:900])
+            cb.update(status="actor_crops_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "prepare":
@@ -1955,7 +1956,7 @@ def handler(job):
             result = prepare(inp)
             cb.update(status="proxy_ready", result=result)
         except Exception as e:
-            cb.update(status="proxy_failed", error=str(e)[:900])
+            cb.update(status="proxy_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     try:
@@ -1963,8 +1964,8 @@ def handler(job):
         cb.update(status="completed", result=result, stats={"frames": len(result["frames"]), "tracks": len(result.get("tracks", []))})
     except Exception as e:
         import traceback
-        print("ANALYSIS_FAILED " + traceback.format_exc(), flush=True)   # visible dans les journaux RunPod
-        cb.update(status="failed", error=str(e)[:900])
+        print("ANALYSIS_FAILED " + scrub(traceback.format_exc()), flush=True)   # visible dans les journaux RunPod
+        cb.update(status="failed", error=scrub(e, 900))
     requests.post(inp["callback_url"], json=cb, timeout=120)
     return {"status": cb["status"], "frames": len(cb.get("result", {}).get("frames", []))}
 

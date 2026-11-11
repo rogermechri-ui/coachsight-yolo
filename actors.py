@@ -133,10 +133,18 @@ def _grass_under_feet(frame, box):
     return float(grass.mean())
 
 
-def _draw_context(frame, picks, width):
+def _draw_context(frame, picks, width, ball=None):
+    """Image de contexte : candidats encadres et lettres ; si le ballon est vu sur
+    cette image (ball = (x, y) en pixels), un anneau jaune le repere, pour que le
+    coach juge ou se passe l'action sans se fier au seul joueur encadre."""
     h, w = frame.shape[:2]
     s = width / w if w > width else 1.0
     img = cv2.resize(frame, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA) if s != 1.0 else frame.copy()
+    if ball is not None:
+        bx, by = int(ball[0] * s), int(ball[1] * s)
+        r = max(9, int(14 * max(s, 0.5)))
+        cv2.circle(img, (bx, by), r, (0, 0, 0), 4)
+        cv2.circle(img, (bx, by), r, (0, 230, 255), 2)
     for p in picks:
         x1, y1, x2, y2 = [int(v * s) for v in p["box_px"]]
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -268,7 +276,8 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                     p["near_ball"] = ball_source == "frame" and p["ball_distance_px"] is not None and p["ball_distance_px"] < 2.5 * p["height_px"]
                 tms = int(round(t * 1000))
                 ctx_name = "context_%s_%09d.jpg" % (eid, tms)
-                ok2, jpg = cv2.imencode(".jpg", _draw_context(frame, picks, ctx_w), [cv2.IMWRITE_JPEG_QUALITY, 80])
+                ball_here = fr["ball"] if fr["ball"] else None      # ballon vu sur CETTE image seulement
+                ok2, jpg = cv2.imencode(".jpg", _draw_context(frame, picks, ctx_w, ball_here), [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok2:
                     zf.writestr(ctx_name, jpg.tobytes())
                 players = []
@@ -297,6 +306,7 @@ def actor_crops(inp, model, shirt_color, download, imgsz=1280):
                                     "grass_under_feet": round(p["grass"], 2)})
                 frames_out.append({"t": round(t, 2), "context": ctx_name if ok2 else None,
                                    "ball_seen": bool(fr["ball"]), "ball_source": ball_source,
+                                   "ball": [round(fr["ball"][0] / w, 4), round(fr["ball"][1] / h, 4)] if fr["ball"] else None,
                                    "players": players})
             out_events.append({"id": eid, "t": t0, "team": side, "frames": frames_out})
         manifest = {"events": out_events, "team_colors": colors, "offsets_s": offsets}
