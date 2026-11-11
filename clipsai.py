@@ -30,6 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from export import FFMPEG
+from safe import scrub
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 # prix indicatifs en $ par million de jetons (entree, sortie) : a ajuster si le tarif change
@@ -79,7 +80,7 @@ def _cut(src, t, clip_s, out):
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-movflags", "+faststart", out]
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out):
-        raise RuntimeError("ffmpeg clip failed: " + (r.stderr or "")[-300:])
+        raise RuntimeError("ffmpeg clip failed: " + scrub((r.stderr or "")[-300:]))
 
 
 def _ask(key, model, mp4, prompt, thinking_budget):
@@ -102,7 +103,7 @@ def _ask(key, model, mp4, prompt, thinking_budget):
                 continue
             break
         except Exception as e:  # reseau
-            last = str(e).replace(key, "***")[:200]
+            last = scrub(str(e).replace(key, "***"), 200)
             time.sleep(5)
     raise RuntimeError(last or "gemini call failed")
 
@@ -154,7 +155,7 @@ def clips_ai(inp, cutter=None):
                     "out_tok": (u.get("candidatesTokenCount", 0) or 0) + (u.get("thoughtsTokenCount", 0) or 0),
                     "mp4_kb": round(len(mp4) / 1024)}
         except Exception as e:
-            return {"t": t, "ok": False, "error": str(e).replace(key, "***")[:300]}
+            return {"t": t, "ok": False, "error": scrub(str(e).replace(key, "***"), 300)}
         finally:
             done[0] += 1
             if done[0] % 10 == 0:

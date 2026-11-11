@@ -13,6 +13,8 @@ import time
 
 import requests
 
+from safe import scrub
+
 FFMPEG = os.environ.get("FFMPEG_BIN") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg")
 
 EXPORT_HEIGHT = int(os.environ.get("EXPORT_HEIGHT", "720"))
@@ -43,7 +45,7 @@ def _run_ffmpeg(args, what):
     r = subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", *args],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError("%s: %s" % (what, r.stderr.strip()[-300:]))
+        raise RuntimeError("%s: %s" % (what, scrub(r.stderr.strip()[-300:])))
 
 
 def _export_segment(src, start, dur, height, fps, crf, dst):
@@ -62,7 +64,7 @@ def _export_title(text, w, h, fps, crf, secs, dst):
     txt.write(text)
     txt.close()
     size = max(18, int(h / 14))
-    draw = ("drawtext=fontfile=%s:textfile=%s:fontcolor=white:fontsize=%d:line_spacing=%d:"
+    draw = ("drawtext=expansion=none:fontfile=%s:textfile=%s:fontcolor=white:fontsize=%d:line_spacing=%d:"
             "x=(w-text_w)/2:y=(h-text_h)/2" % (EXPORT_FONT, txt.name, size, size // 2))
     try:
         _run_ffmpeg(["-f", "lavfi", "-i", "color=c=0x111418:s=%dx%d:r=%d:d=%.2f" % (w, h, fps, secs),
