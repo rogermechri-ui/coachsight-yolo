@@ -41,12 +41,16 @@ import json
 import audio
 import clipsai
 from export import FFMPEG
-from safe import scrub, check_url, ffmpeg_protocols
+from safe import scrub, check_url, ffmpeg_protocols, read_limited
 
 DEFAULT_KEEP = ["goal", "shot", "big_chance", "save", "cross", "corner", "free_kick", "penalty", "foul",
                 "turnover", "tackle", "counter_attack", "aerial_duel"]
 # types lus par le modele -> codes de la bibliotheque d'actions du site
 CODE = {"sub": "substitution"}
+
+
+MAX_SEGMENTS = int(os.environ.get("MAX_SEGMENTS", "6000"))      # 6000 x 6 s = 10 h
+MAX_SEGMENT_MB = int(os.environ.get("MAX_SEGMENT_MB", "200"))
 
 
 class HlsSource:
@@ -56,9 +60,11 @@ class HlsSource:
 
     def __init__(self, segments_json_url, workers=4):
         with urllib.request.urlopen(check_url(segments_json_url, "segments list address"), timeout=60) as r:
-            j = json.loads(r.read())
+            j = json.loads(read_limited(r, 16 << 20, "segments list"))
         self.seg_s = float(j.get("segment_s") or 6)
         self.urls = j["urls"]
+        if not isinstance(self.urls, list) or len(self.urls) > MAX_SEGMENTS:
+            raise ValueError("segments list refused: more than %d segments" % MAX_SEGMENTS)
         self.dir = tempfile.mkdtemp(prefix="hls_")
         self.workers = workers
 
@@ -74,10 +80,12 @@ class HlsSource:
         for k in range(10):
             try:
                 with urllib.request.urlopen(self.urls[i], timeout=60) as r:
-                    data = r.read()
+                    data = read_limited(r, MAX_SEGMENT_MB << 20, "segment")
                 open(p + ".part", "wb").write(data)
                 os.replace(p + ".part", p)
                 return p
+            except ValueError:      # segment trop gros : refus immediat, sans nouvelle tentative
+                raise
             except Exception as e:  # 429 (trop de demandes) : on attend de plus en plus longtemps
                 last = e
                 time.sleep(min(30, 2 * (k + 1)))
