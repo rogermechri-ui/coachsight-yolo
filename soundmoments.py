@@ -41,6 +41,7 @@ import json
 import audio
 import clipsai
 from export import FFMPEG
+from safe import scrub
 
 DEFAULT_KEEP = ["goal", "shot", "big_chance", "save", "cross", "corner", "free_kick", "penalty", "foul",
                 "turnover", "tackle", "counter_attack", "aerial_duel"]
@@ -79,7 +80,7 @@ class HlsSource:
             except Exception as e:  # 429 (trop de demandes) : on attend de plus en plus longtemps
                 last = e
                 time.sleep(min(30, 2 * (k + 1)))
-        raise RuntimeError("segment %d: %s" % (i, str(last)[:120]))
+        raise RuntimeError("segment %d: %s" % (i, scrub(last, 120)))
 
     def fetch_all(self):
         with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
@@ -105,7 +106,7 @@ class HlsSource:
                     "-movflags", "+faststart", out]
             r = subprocess.run(args, capture_output=True, text=True)
             if r.returncode != 0 or not os.path.exists(out):
-                raise RuntimeError("ffmpeg clip failed: " + (r.stderr or "")[-300:])
+                raise RuntimeError("ffmpeg clip failed: " + scrub((r.stderr or "")[-300:]))
         return cut
 
     def close(self):
@@ -218,7 +219,7 @@ def _put_json(url, obj):
         except Exception as e:
             last = e
             time.sleep(3 * (k + 1))
-    return "upload failed: %s" % str(last)[:120]
+    return "upload failed: %s" % scrub(last, 120)
 
 
 def sound_moments(inp):

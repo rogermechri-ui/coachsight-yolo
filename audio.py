@@ -26,6 +26,7 @@ import tempfile
 import time
 
 from export import FFMPEG
+from safe import scrub
 
 FFPROBE = os.environ.get("FFPROBE", "ffprobe")
 
@@ -81,7 +82,7 @@ def audio_energy(inp):
             "-map", "[oa]", "-f", "null", "-", "-map", "[ob]", "-f", "null", "-", "-map", "[oc]", "-f", "null", "-"]
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError("ffmpeg audio failed: " + (r.stderr or "")[-600:])
+        raise RuntimeError("ffmpeg audio failed: " + scrub((r.stderr or "")[-600:]))
     lv = {k: _read_levels(p) for k, p in files.items()}
     for p in files.values():
         try:

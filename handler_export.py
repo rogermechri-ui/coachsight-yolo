@@ -21,6 +21,7 @@ import clipsai
 import export
 import hls
 import soundmoments
+from safe import scrub
 
 STARTED = time.time()
 
@@ -48,7 +49,7 @@ def handler(event):
     try:
         cb.update(status="export_ready", result=export.export_clips(inp))
     except Exception as e:
-        cb.update(status="export_failed", error=str(e)[:900])
+        cb.update(status="export_failed", error=scrub(e, 900))
     requests.post(inp["callback_url"], json=cb, timeout=120)
     return {"status": cb["status"]}
 
@@ -61,7 +62,7 @@ def _run(inp, name, fn):
     try:
         cb.update(status=name + "_ready", result=fn(inp))
     except Exception as e:
-        cb.update(status=name + "_failed", error=str(e)[:900])
+        cb.update(status=name + "_failed", error=scrub(e, 900))
     requests.post(inp["callback_url"], json=cb, timeout=120)
     return {"status": cb["status"]}
 
