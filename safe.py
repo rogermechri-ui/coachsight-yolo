@@ -141,3 +141,33 @@ def ffmpeg_protocols(src):
         return []
     remote = str(src).startswith(("http://", "https://"))
     return ["-protocol_whitelist", FFMPEG_REMOTE_PROTOCOLS if remote else FFMPEG_LOCAL_PROTOCOLS]
+
+
+# --------------------------------------------------------------------------
+# Limites de taille (lot 3a)
+# --------------------------------------------------------------------------
+# Une video ou un fichier enorme remplirait le disque du moteur et bloquerait
+# les taches suivantes. Les limites se reglent par variable, sans reconstruire.
+
+def max_video_bytes():
+    """Taille maximale d'une video telechargee (MAX_VIDEO_GB, 12 Go par defaut ; 0 = sans limite)."""
+    try:
+        gb = float(os.environ.get("MAX_VIDEO_GB") or 12)
+    except ValueError:
+        gb = 12.0
+    return int(gb * (1 << 30)) if gb > 0 else 0
+
+
+def check_size(n, limit, what="file"):
+    """Leve ValueError si `n` octets depassent `limit` (0 ou None = pas de limite)."""
+    if limit and n is not None and n > limit:
+        raise ValueError("%s too large: %.2f GB (max %.2f GB)" % (what, n / (1 << 30), limit / (1 << 30)))
+    return n
+
+
+def read_limited(resp, limit, what="file"):
+    """Lit une reponse (urllib) sans jamais garder plus de `limit` octets en memoire."""
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("%s too large (max %d MB)" % (what, limit >> 20))
+    return data
