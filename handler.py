@@ -22,7 +22,7 @@ import pitch_track
 import actors
 import ball as ballmod   # 'ball' est deja une variable locale du suivi
 import hot
-from safe import scrub, check_inputs, check_url, ffmpeg_protocols
+from safe import scrub, check_inputs, check_url, ffmpeg_protocols, max_video_bytes, check_size
 
 try:
     import pytesseract
@@ -460,7 +460,20 @@ def download(url, attempts=5):
     au lieu d'echouer."""
     check_url(url, "video address")
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    try:
+        return _download_to(url, tmp, attempts)
+    except BaseException:
+        # Echec ou video trop grosse : on ne laisse pas un fichier partiel sur le disque.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _download_to(url, tmp, attempts):
     done, total = 0, None
+    limit = max_video_bytes()
     for k in range(attempts):
         headers = {"Range": "bytes=%d-" % done} if done else {}
         try:
@@ -471,10 +484,12 @@ def download(url, attempts=5):
                 if total is None:
                     size = r.headers.get("Content-Length")
                     total = (int(size) + done) if size else None
+                    check_size(total, limit, "video")      # taille annoncee : refus avant de telecharger
                 with open(tmp, "ab" if done else "wb") as f:
                     for chunk in r.iter_content(1 << 20):
                         f.write(chunk)
                         done += len(chunk)
+                        check_size(done, limit, "video")   # taille reelle (serveur sans Content-Length)
             if total is None or done >= total:
                 return tmp
         except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError,
