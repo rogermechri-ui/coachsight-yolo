@@ -21,7 +21,7 @@ import clipsai
 import export
 import hls
 import soundmoments
-from safe import scrub
+from safe import scrub, check_inputs
 
 STARTED = time.time()
 
@@ -29,6 +29,18 @@ STARTED = time.time()
 def handler(event):
     inp = event.get("input") or {}
     task = inp.get("task")
+    bad = check_inputs(inp)
+    if bad:
+        # Adresse refusee (pas https, hote prive ou hors liste) : rien n'est telecharge ni envoye.
+        status = ("export" if task == "export_clips" else str(task)) + "_failed"
+        print("INPUT_REFUSED " + scrub(bad), flush=True)
+        if inp.get("callback_url") and not bad.startswith("input callback_url "):
+            try:
+                requests.post(inp["callback_url"], json={"job_id": inp.get("job_id"), "callback_token": inp.get("callback_token"),
+                                                         "engine": "export-cpu", "status": status, "error": scrub(bad, 900)}, timeout=60)
+            except Exception:
+                pass
+        return {"status": status, "error": scrub(bad, 900)}
     if task == "hls":
         return _run(inp, "hls", hls.build_hls)
     if task == "audio":

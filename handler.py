@@ -22,7 +22,7 @@ import pitch_track
 import actors
 import ball as ballmod   # 'ball' est deja une variable locale du suivi
 import hot
-from safe import scrub
+from safe import scrub, check_inputs, check_url, ffmpeg_protocols
 
 try:
     import pytesseract
@@ -321,7 +321,8 @@ def _ffmpeg_frames(source, start, end, fps, width, gpu):
             cmd += ["-resize", "%dx%d" % (w, h)]
     elif (w, h) != (w0, h0):
         vf.append("scale=%d:%d" % (w, h))
-    cmd += ["-ss", "%.3f" % start, "-t", "%.3f" % max(0.0, end - start + 0.5 / fps), "-i", source,
+    cmd += ["-ss", "%.3f" % start, "-t", "%.3f" % max(0.0, end - start + 0.5 / fps),
+            *ffmpeg_protocols(source), "-i", source,
             "-vf", ",".join(vf), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     n_bytes = w * h * 3
@@ -457,6 +458,7 @@ def download(url, attempts=5):
     """Copie locale de la video. Si la connexion coupe en cours de route (gros
     fichiers de plusieurs Go), on reprend la ou on s'etait arrete (en-tete Range)
     au lieu d'echouer."""
+    check_url(url, "video address")
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     done, total = 0, None
     for k in range(attempts):
@@ -1743,7 +1745,7 @@ def _ffmpeg_encode(src, dst, width, fps, encoder, cq=PROXY_CQ, gpu_decode=True):
     else:
         codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cq)]
     net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"] if src.startswith("http") else []
-    cmd = [FFMPEG, "-y", "-loglevel", "error", *net, *pre, "-i", src, "-vf", vf, "-an",
+    cmd = [FFMPEG, "-y", "-loglevel", "error", *net, *pre, *ffmpeg_protocols(src), "-i", src, "-vf", vf, "-an",
            *codec, "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -1892,8 +1894,24 @@ def summarize(result):
             "players_per_frame_median": float(np.median([len(f["points"]) for f in result.get("frames", [])] or [0]))}
 
 
+_FAILED_STATUS = {"label_batch": "label_batch_failed", "pitch_probe": "probe_failed", "export_clips": "export_failed",
+                  "actor_crops": "actor_crops_failed", "prepare": "proxy_failed"}
+
+
 def handler(job):
     inp = job["input"]
+    bad = check_inputs(inp)
+    if bad:
+        # Adresse refusee (pas https, hote prive ou hors liste) : rien n'est telecharge ni envoye.
+        status = _FAILED_STATUS.get(inp.get("task"), "failed")
+        print("INPUT_REFUSED " + scrub(bad), flush=True)
+        if inp.get("callback_url") and not bad.startswith("input callback_url "):
+            try:
+                requests.post(inp["callback_url"], json={"job_id": inp.get("job_id"), "callback_token": inp.get("callback_token"),
+                                                         "status": status, "error": scrub(bad, 900)}, timeout=60)
+            except Exception:
+                pass
+        return {"status": status, "error": scrub(bad, 900)}
     if not inp.get("callback_url"):
         # Test direct (console RunPod) : pas d'application a prevenir, on renvoie un resume.
         if inp.get("task") == "prepare":

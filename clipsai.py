@@ -30,7 +30,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from export import FFMPEG
-from safe import scrub
+from safe import scrub, ffmpeg_protocols
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 # prix indicatifs en $ par million de jetons (entree, sortie) : a ajuster si le tarif change
@@ -75,7 +75,7 @@ def _cut(src, t, clip_s, out):
     start = max(0.0, t - clip_s / 2.0)
     net = (["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10"]
            if str(src).startswith("http") else [])
-    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net, "-ss", "%.2f" % start, "-i", src,
+    args = [FFMPEG, "-y", "-loglevel", "error", "-nostdin", *net, "-ss", "%.2f" % start, *ffmpeg_protocols(src), "-i", src,
             "-t", str(clip_s), "-an", "-vf", "scale=-2:480,fps=10",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-movflags", "+faststart", out]
     r = subprocess.run(args, capture_output=True, text=True)
