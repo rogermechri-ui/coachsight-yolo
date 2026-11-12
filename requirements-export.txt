@@ -1,0 +1,4 @@
+# Moteur d'export (CPU) : versions directes figees le 12 novembre 2026 (journal de construction).
+# Les versions indirectes sont figees dans constraints-export.txt.
+runpod==2.1.0
+requests==2.34.2
