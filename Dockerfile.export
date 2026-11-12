@@ -6,5 +6,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 RUN pip install --no-cache-dir runpod requests
+# Liste des versions reellement installees, visible dans le journal de construction.
+RUN echo "PIP_FREEZE_BEGIN" && python --version && pip freeze && echo "PIP_FREEZE_END" && (ffmpeg -version | head -1)
 COPY safe.py export.py hls.py audio.py clipsai.py soundmoments.py handler_export.py ./
 CMD ["python", "-u", "handler_export.py"]
