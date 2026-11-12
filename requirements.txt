@@ -1,14 +1,12 @@
-runpod
-ultralytics
-opencv-python-headless
-requests
-numpy
-pytesseract
-   runpod
-   ultralytics
-   opencv-python-headless
-   requests
-   numpy
-   pytesseract
-   lap>=0.5.12
-scipy
+# Versions directes figees le 12 novembre 2026, relevees dans le journal de construction
+# du moteur de test (PIP_FREEZE). Les versions indirectes sont figees dans constraints.txt.
+# torch, torchvision et les paquets nvidia-* viennent de l'image de base (pytorch 2.7.1 / cu128).
+runpod==1.12.0
+ultralytics==8.4.194
+opencv-python-headless==5.0.0.93
+opencv-python==5.0.0.93
+requests==2.34.2
+numpy==2.2.6
+pytesseract==0.3.13
+lap==0.5.13
+scipy==1.17.1
