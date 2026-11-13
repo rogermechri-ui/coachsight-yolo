@@ -10,4 +10,10 @@ RUN pip install --no-cache-dir -c constraints.txt -r requirements.txt
 RUN echo "PIP_FREEZE_BEGIN" && python --version && pip freeze && echo "PIP_FREEZE_END" && (ffmpeg -version | head -1)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8m.pt')"
 COPY safe.py handler.py pitch_fit.py pitch_track.py actors.py hot.py export.py ball.py botsort_coachsight.yaml ./
+# Le moteur tourne sans droits administrateur (lot 3b, partie 2) : un fichier ou un
+# logiciel piege ne pourrait ni modifier le systeme ni le code installe. Le compte
+# peut lire /app (modele compris) ; ses ecritures vont dans /tmp et son dossier personnel.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin coach
+ENV HOME=/home/coach YOLO_CONFIG_DIR=/tmp/Ultralytics
+USER coach
 CMD ["python", "-u", "handler.py"]

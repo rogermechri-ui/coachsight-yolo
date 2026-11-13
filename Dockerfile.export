@@ -10,4 +10,9 @@ RUN pip install --no-cache-dir -c constraints-export.txt -r requirements-export.
 # Liste des versions reellement installees, visible dans le journal de construction.
 RUN echo "PIP_FREEZE_BEGIN" && python --version && pip freeze && echo "PIP_FREEZE_END" && (ffmpeg -version | head -1)
 COPY safe.py export.py hls.py audio.py clipsai.py soundmoments.py handler_export.py ./
+# Le moteur tourne sans droits administrateur (lot 3b, partie 2) : le compte lit /app
+# et n'ecrit que dans /tmp et son dossier personnel.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin coach
+ENV HOME=/home/coach
+USER coach
 CMD ["python", "-u", "handler_export.py"]
