@@ -35,3 +35,17 @@ def test_dockerfiles_use_the_pinned_files():
     e = open(os.path.join(ROOT, "Dockerfile.export")).read()
     assert "-c constraints.txt -r requirements.txt" in d and "COPY requirements.txt constraints.txt" in d
     assert "-c constraints-export.txt -r requirements-export.txt" in e
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.export"])
+def test_engine_does_not_run_as_root(name):
+    """Lot 3b, partie 2 : la derniere instruction USER designe un compte sans droits
+    administrateur, placee apres les installations et avant le demarrage."""
+    lines = [l.strip() for l in open(os.path.join(ROOT, name)) if l.strip() and not l.strip().startswith("#")]
+    users = [(i, l.split()[1]) for i, l in enumerate(lines) if l.upper().startswith("USER ")]
+    assert users, "no USER instruction"
+    i, user = users[-1]
+    assert user not in ("root", "0")
+    assert lines[-1].startswith("CMD ") and i < len(lines) - 1
+    assert not any(l.startswith(("RUN pip", "RUN apt-get", "COPY ")) for l in lines[i:])
+    assert any("useradd" in l and user in l for l in lines[:i])
