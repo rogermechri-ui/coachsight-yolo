@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -c constraints.txt -r requirements.txt
 # (sert a figer les versions a l'identique ; ne change rien au fonctionnement).
 RUN echo "PIP_FREEZE_BEGIN" && python --version && pip freeze && echo "PIP_FREEZE_END" && (ffmpeg -version | head -1)
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8m.pt')"
-COPY safe.py handler.py pitch_fit.py pitch_track.py actors.py hot.py export.py ball.py botsort_coachsight.yaml ./
+COPY safe.py pitchmask.py coachteams.py handler.py pitch_fit.py pitch_track.py actors.py hot.py export.py ball.py botsort_coachsight.yaml ./
 # Le moteur tourne sans droits administrateur (lot 3b, partie 2) : un fichier ou un
 # logiciel piege ne pourrait ni modifier le systeme ni le code installe. Le compte
 # peut lire /app (modele compris) ; ses ecritures vont dans /tmp et son dossier personnel.
