@@ -34,6 +34,11 @@ except Exception:  # OCR indisponible : le suivi continue sans numeros
     pytesseract = None
 
 MODEL = YOLO(os.environ.get("YOLO_MODEL", "yolov8m.pt"))
+# Detecteur CoachSight a 3 classes (joueur, gardien, arbitre), utilise UNIQUEMENT pour
+# pre-annoter les lots d'annotation. Present seulement dans l'image du moteur de test ;
+# ANNOTATION_MODEL=off le desactive. Le suivi et l'analyse gardent MODEL.
+_ANN_PATH = os.environ.get("ANNOTATION_MODEL", "/app/models/coachsight-detecteur-v2.pt")
+ANNOTATION_MODEL = YOLO(_ANN_PATH) if _ANN_PATH != "off" and os.path.exists(_ANN_PATH) else None
 PITCH_L, PITCH_W = 105.0, 68.0
 SAMPLE_FPS = float(os.environ.get("SAMPLE_FPS", "2"))
 READ_NUMBERS = os.environ.get("READ_NUMBERS", "0") != "0"
@@ -1960,7 +1965,7 @@ _FAILED_STATUS = {"label_batch": "label_batch_failed", "pitch_probe": "probe_fai
 
 
 def _annotation_batch(inp):
-    return annotation.annotation_batch(inp, MODEL, download, YOLO_IMGSZ, play_windows, video_end, scrub)
+    return annotation.annotation_batch(inp, ANNOTATION_MODEL or MODEL, download, YOLO_IMGSZ, play_windows, video_end, scrub)
 
 
 def handler(job):

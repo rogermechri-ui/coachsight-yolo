@@ -41,3 +41,10 @@ def test_cvat_structure_files():
     train, yaml = annotation.cvat_index(["a_1", "a_2"])
     assert train == "./images/train/a_1.jpg\n./images/train/a_2.jpg\n"
     assert "train: train.txt" in yaml and "2: arbitre" in yaml
+
+
+def test_detector_mode():
+    class M3: names = {0: "joueur", 1: "gardien", 2: "arbitre"}
+    class Coco: names = {0: "person", 1: "bicycle"}
+    assert annotation.detector_mode(M3()) == (None, True)
+    assert annotation.detector_mode(Coco()) == ([0], False)
