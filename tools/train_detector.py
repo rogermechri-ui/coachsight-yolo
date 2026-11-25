@@ -99,10 +99,10 @@ def main():
 
     model = YOLO(a.base)
     model.train(data=str(ds3), epochs=a.epochs, imgsz=a.imgsz, batch=a.batch, seed=a.seed,
-                project=str(work / "runs"), name="coachsight", exist_ok=True,
+                project=str(work.resolve() / "runs"), name="coachsight", exist_ok=True,
                 patience=20, cos_lr=True, mosaic=1.0, close_mosaic=10,
                 fliplr=0.5, flipud=0.0, hsv_h=0.015, hsv_s=0.5, hsv_v=0.3)
-    best = work / "runs" / "coachsight" / "weights" / "best.pt"
+    best = Path(str(model.trainer.best))  # chemin reel (Ultralytics peut ajouter runs/detect/)
     shutil.copy(best, work / "best.pt")
 
     lines = ["Images : %d entrainement, %d validation" % (len(train), len(val)), ""]
