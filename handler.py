@@ -20,6 +20,7 @@ from ultralytics import YOLO
 import pitch_fit
 import pitch_track
 import actors
+import annotation
 import calibcheck
 import coachteams
 import pitchmask
@@ -1954,7 +1955,12 @@ def summarize(result):
 
 
 _FAILED_STATUS = {"label_batch": "label_batch_failed", "pitch_probe": "probe_failed", "export_clips": "export_failed",
-                  "actor_crops": "actor_crops_failed", "prepare": "proxy_failed"}
+                  "actor_crops": "actor_crops_failed", "annotation_batch": "annotation_batch_failed",
+                  "prepare": "proxy_failed"}
+
+
+def _annotation_batch(inp):
+    return annotation.annotation_batch(inp, MODEL, download, YOLO_IMGSZ, play_windows, video_end, scrub)
 
 
 def handler(job):
@@ -1988,8 +1994,13 @@ def handler(job):
                 return {"status": "actor_crops_ready", "result": actors.actor_crops(inp, MODEL, shirt_color, download, YOLO_IMGSZ)}
             except Exception as e:
                 return {"status": "actor_crops_failed", "error": scrub(e, 900)}
+        if inp.get("task") == "annotation_batch":
+            try:
+                return {"status": "annotation_batch_ready", "result": _annotation_batch(inp)}
+            except Exception as e:
+                return {"status": "annotation_batch_failed", "error": scrub(e, 900)}
         if inp.get("task"):
-            return {"status": "failed", "error": "direct test supports the default analysis, prepare, export_clips and actor_crops only"}
+            return {"status": "failed", "error": "direct test supports the default analysis, prepare, export_clips, actor_crops and annotation_batch only"}
         try:
             return {"status": "completed", "summary": summarize(process(inp))}
         except Exception as e:
@@ -2000,6 +2011,13 @@ def handler(job):
             cb.update(status="label_batch_ready", result=label_batch(inp))
         except Exception as e:
             cb.update(status="label_batch_failed", error=scrub(e, 900))
+        requests.post(inp["callback_url"], json=cb, timeout=120)
+        return {"status": cb["status"]}
+    if inp.get("task") == "annotation_batch":
+        try:
+            cb.update(status="annotation_batch_ready", result=_annotation_batch(inp))
+        except Exception as e:
+            cb.update(status="annotation_batch_failed", error=scrub(e, 900))
         requests.post(inp["callback_url"], json=cb, timeout=120)
         return {"status": cb["status"]}
     if inp.get("task") == "pitch_probe":
