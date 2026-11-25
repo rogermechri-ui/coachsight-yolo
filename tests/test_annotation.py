@@ -35,3 +35,9 @@ def test_yolo_line_normalised_and_clipped():
 def test_small_boxes_dropped_using_original_size():
     assert annotation.keep_box((0, 0, 10, 10), 0.5, 15)        # 20 px d'origine : gardee
     assert not annotation.keep_box((0, 0, 10, 6), 0.5, 15)     # 12 px d'origine : ecartee
+
+
+def test_cvat_structure_files():
+    train, yaml = annotation.cvat_index(["a_1", "a_2"])
+    assert train == "./images/train/a_1.jpg\n./images/train/a_2.jpg\n"
+    assert "train: train.txt" in yaml and "2: arbitre" in yaml
