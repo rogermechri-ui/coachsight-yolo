@@ -14,7 +14,8 @@ Entree (input) :
                    (defaut 15, regle du guide d'annotation)
   max_width        largeur maximale des images (defaut 1920)
   upload_url       adresse signee ou deposer le zip (PUT)
-Sortie : zip au format Ultralytics (images/, labels/, classes.txt, data.yaml)
+Sortie : zip au format Ultralytics tel que CVAT l'importe (images/train/, labels/train/,
+train.txt, classes.txt, data.yaml)
 plus manifest.json. Les boites pre-annotees sont toutes de classe 0 (« joueur ») :
 c'est a la personne qui annote de supprimer les fausses boites (staff, public,
 remplacants) et de passer les gardiens (classe 1) et arbitres (classe 2).
@@ -60,6 +61,14 @@ def yolo_line(box, width, height, cls=0):
                                        (x2 - x1) / width, (y2 - y1) / height)
 
 
+def cvat_index(names):
+    """Fichiers de structure attendus par l'import « Ultralytics YOLO Detection » de
+    CVAT : images/train/, labels/train/, train.txt (liste des images) et data.yaml."""
+    train = "".join("./images/train/%s.jpg\n" % n for n in names)
+    yaml = "path: .\ntrain: train.txt\nnames:\n" + "".join("  %d: %s\n" % (i, c) for i, c in enumerate(CLASSES))
+    return train, yaml
+
+
 def keep_box(box, scale, min_box_px):
     """Vrai si la boite fait au moins `min_box_px` de haut dans l'image d'origine
     (`scale` = taille de l'image enregistree / taille d'origine)."""
@@ -81,7 +90,7 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
         times = sample_times(windows, count, phase, min_gap)
         buf = io.BytesIO()
         zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
-        items, boxes_total = [], 0
+        items, names, boxes_total = [], [], 0
         for t in times:
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
             ok, frame = cap.read()
@@ -102,17 +111,19 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
                 boxes.append(round(float(b.conf[0]), 3))
             name = "%s_%09d" % (inp.get("match_slug", "match"), int(round(t * 1000)))
             ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            zf.writestr("images/%s.jpg" % name, jpg.tobytes())
-            zf.writestr("labels/%s.txt" % name, "\n".join(lines) + ("\n" if lines else ""))
-            items.append({"t": t, "file": "images/%s.jpg" % name, "width": w, "height": h,
+            zf.writestr("images/train/%s.jpg" % name, jpg.tobytes())
+            zf.writestr("labels/train/%s.txt" % name, "\n".join(lines) + ("\n" if lines else ""))
+            names.append(name)
+            items.append({"t": t, "file": "images/train/%s.jpg" % name, "width": w, "height": h,
                           "boxes": len(lines), "confidences": boxes})
             boxes_total += len(lines)
     finally:
         cap.release()
         os.remove(src)
     zf.writestr("classes.txt", "\n".join(CLASSES) + "\n")
-    zf.writestr("data.yaml", "path: .\ntrain: images\nval: images\nnames:\n" +
-                "".join("  %d: %s\n" % (i, c) for i, c in enumerate(CLASSES)))
+    train_txt, data_yaml = cvat_index(names)
+    zf.writestr("train.txt", train_txt)
+    zf.writestr("data.yaml", data_yaml)
     zf.writestr("manifest.json", json.dumps({
         "match": inp.get("match_name"), "classes": CLASSES, "phase": round(phase, 3),
         "min_gap_s": min_gap, "pre_annotation": "tous « joueur » : corriger a la main",
