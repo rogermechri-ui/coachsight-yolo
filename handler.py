@@ -20,6 +20,9 @@ from ultralytics import YOLO
 import pitch_fit
 import pitch_track
 import actors
+import calibcheck
+import coachteams
+import pitchmask
 import ball as ballmod   # 'ball' est deja une variable locale du suivi
 import hot
 from safe import scrub, check_inputs, check_url, ffmpeg_protocols, max_video_bytes, check_size
@@ -105,6 +108,16 @@ OFF_PITCH_DEPTH_M = float(os.environ.get("OFF_PITCH_DEPTH_M", "3"))
 # est retiree. 0 = desactive.
 STATIC_MIN_S = float(os.environ.get("STATIC_MIN_S", "20"))
 STATIC_SPEED = float(os.environ.get("STATIC_SPEED", "0.25"))
+# Pelouse visible : une piste dont les pieds sont rarement sur la pelouse (public,
+# banc, staff) est retiree. 0 = desactive.
+GRASS_FILTER = os.environ.get("GRASS_FILTER", "1") != "0"
+# Equipes a partir des couleurs de maillot saisies par le coach. 0 = desactive.
+COACH_COLOR_TEAMS = os.environ.get("COACH_COLOR_TEAMS", "1") != "0"
+# Calage qui saute d'une image a l'autre (camera qui suit le jeu) : image declaree
+# non calee quand la vitesse mediane des joueurs depasse CALIB_JUMP_MS (m/s).
+# CALIB_JUMP_CHECK=0 = desactive.
+CALIB_JUMP_CHECK = os.environ.get("CALIB_JUMP_CHECK", "1") != "0"
+CALIB_JUMP_MS = float(os.environ.get("CALIB_JUMP_MS", str(calibcheck.MAX_SPEED_MS)))
 
 
 def shirt_color(frame, box):
@@ -656,6 +669,7 @@ def track(source, windows, fps_out, timings):
     ratio = max(1, int(round(TRACK_FPS / fps_out))) if v2 else 1
     warps = []        # mouvements de camera (2x3) depuis la derniere image gardee
     motion = {}       # piste -> [(t, x, y stabilises, hauteur)] pour reperer les immobiles
+    on_grass = {}     # piste -> [pieds sur la pelouse ? par image] (filtre pelouse)
     for wi, (ws, we) in enumerate(windows):
         clock = time.time()
         if v2:
@@ -704,6 +718,12 @@ def track(source, windows, fps_out, timings):
                 clock = time.time()
                 continue
             pts = []
+            gmask = ghull = None
+            if GRASS_FILTER and v2:
+                try:
+                    gmask, ghull = pitchmask.grass_mask(frame)
+                except Exception:
+                    gmask = ghull = None
             if v2:
                 for W_ in warps:
                     if W_.shape == (2, 3) and np.all(np.isfinite(W_)):
@@ -734,6 +754,8 @@ def track(source, windows, fps_out, timings):
                         t_ocr += time.time() - c
                         if n is not None:
                             votes.setdefault(tid_i, Counter()).update([n])
+                    if ghull is not None and tid_i >= 0:
+                        on_grass.setdefault(tid_i, []).append(bool(pitchmask.foot_on_pitch(gmask, ghull, box, (w, h))))
                     bx = [round(box[0] / w, 4), round(box[1] / h, 4), round(box[2] / w, 4), round(box[3] / h, 4)]
                     pts.append((tid_i, cx / w, cy / h, ball, col, bx))
             if ballmod.BALL_ZOOM and not any(p[3] for p in pts):
@@ -759,7 +781,9 @@ def track(source, windows, fps_out, timings):
             static.add(tid)
             if len(sample) < 300:      # pour la verification a l'oeil
                 sample.append([round(ms[0][0], 1), round(ms[-1][0], 1), round(ms[0][4], 3), round(ms[0][5], 3)])
-    timings.update(static_tracks=len(static), static_sample=sample)
+    off_grass = pitchmask.off_pitch_tracks(on_grass) if GRASS_FILTER else set()
+    static |= off_grass
+    timings.update(static_tracks=len(static), static_sample=sample, off_grass_tracks=len(off_grass))
     timings.update(read_s=round(t_read, 1), detect_s=round(t_detect, 1), ball_zoom_hits=n_zoom,
                    yolo_s=round(t_yolo, 1), tracker_s=round(t_detect - t_yolo, 1), track_fps=fps_out * ratio,
                    color_s=round(t_color, 1), ocr_s=round(t_ocr, 1),
@@ -1407,7 +1431,14 @@ def process(inp):
         for tid, c in votes.items():
             merged.setdefault(stitch["map"].get(tid, tid), Counter()).update(c)
         votes = merged
-        track_team, color_team, team_rgb = teams_by_window(placed)
+        coach = None
+        if COACH_COLOR_TEAMS:
+            try:
+                coach = coachteams.teams_from_coach_colors(placed, inp.get("team_kit_color"), inp.get("opponent_kit_color"))
+            except Exception:
+                coach = None
+        timings["teams_from"] = "coach_colors" if coach else "auto"
+        track_team, color_team, team_rgb = coach or teams_by_window(placed)
     else:
         placed = assign_ids(placed)
         track_team, color_team, team_rgb = teams_whole_match(placed)
@@ -1458,6 +1489,18 @@ def process(inp):
         # marquee non calee, pour le site comme pour les mesures tactiques.
         ok = bool(cal) and positions_plausible([(p["x"], p["y"]) for p in out if not p["ball"]])
         frames.append({"t": tt, "points": out, "calibrated": ok, "view": view_of(i) if ok else None})
+    # Calage qui saute (camera qui suit le jeu) : l'image est marquee non calee,
+    # donc masquee sur le schema et ignoree des mesures tactiques. Jamais bloquant.
+    jump_hidden = 0
+    if CALIB_JUMP_CHECK and pitch_info:
+        try:
+            for i in calibcheck.jump_frames(frames, max_speed=CALIB_JUMP_MS):
+                frames[i]["calibrated"] = False
+                frames[i]["view"] = None
+                jump_hidden += 1
+        except Exception as e:
+            timings["calib_jump_error"] = scrub(e, 200)
+    timings["calib_jump_frames"] = jump_hidden
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
@@ -1471,6 +1514,7 @@ def process(inp):
     if pitch_info:
         calibration.update(pitch_info)
         calibration["calibrated"] = calibration["calibrated"] or pitch_info["frames_calibrated"] > 0
+        calibration["jump_frames_hidden"] = jump_hidden
     elif camera_info.get("source") == "auto":
         calibration["method"] = "camera_tracking"
         calibration["error"] = camera_info.get("error", "camera position not found")
