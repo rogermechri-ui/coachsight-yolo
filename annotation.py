@@ -16,7 +16,8 @@ Entree (input) :
   upload_url       adresse signee ou deposer le zip (PUT)
 Sortie : zip au format Ultralytics tel que CVAT l'importe (images/train/, labels/train/,
 train.txt, classes.txt, data.yaml)
-plus manifest.json. Les boites pre-annotees sont toutes de classe 0 (« joueur ») :
+plus manifest.json. Avec le modele d'origine, les boites pre-annotees sont toutes de classe 0 (« joueur ») ;
+avec le detecteur CoachSight a 3 classes (ANNOTATION_MODEL), elles portent joueur / gardien / arbitre. Dans tous les cas :
 c'est a la personne qui annote de supprimer les fausses boites (staff, public,
 remplacants) et de passer les gardiens (classe 1) et arbitres (classe 2).
 """
@@ -75,7 +76,17 @@ def keep_box(box, scale, min_box_px):
     return (box[3] - box[1]) / max(scale, 1e-6) >= min_box_px
 
 
+def detector_mode(model):
+    """Modele a 3 classes (joueur, gardien, arbitre) : on garde ses classes.
+    Sinon (modele COCO d'origine) : « personne » (classe 0), tout est pre-annote joueur."""
+    names = getattr(model, "names", None) or {}
+    if [names[k] for k in sorted(names)] == CLASSES:
+        return None, True
+    return [0], False
+
+
 def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub):
+    only_classes, own_classes = detector_mode(model)
     count = int(inp.get("count", 100))
     min_gap = float(inp.get("min_gap_s", MIN_GAP_S))
     conf = float(inp.get("conf", 0.25))
@@ -97,7 +108,7 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
             if not ok:
                 continue
             h0, w0 = frame.shape[:2]
-            res = model(frame, classes=[0], conf=conf, imgsz=imgsz, verbose=False)[0]
+            res = model(frame, classes=only_classes, conf=conf, imgsz=imgsz, verbose=False)[0]
             if w0 > max_w:
                 frame = cv2.resize(frame, (max_w, int(h0 * max_w / w0)), interpolation=cv2.INTER_AREA)
             h, w = frame.shape[:2]
@@ -107,7 +118,7 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
                 x1, y1, x2, y2 = [float(v) * scale for v in b.xyxy[0].tolist()]
                 if not keep_box((x1, y1, x2, y2), scale, min_px):
                     continue
-                lines.append(yolo_line((x1, y1, x2, y2), w, h, 0))
+                lines.append(yolo_line((x1, y1, x2, y2), w, h, int(b.cls[0]) if own_classes else 0))
                 boxes.append(round(float(b.conf[0]), 3))
             name = "%s_%09d" % (inp.get("match_slug", "match"), int(round(t * 1000)))
             ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -126,7 +137,9 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
     zf.writestr("data.yaml", data_yaml)
     zf.writestr("manifest.json", json.dumps({
         "match": inp.get("match_name"), "classes": CLASSES, "phase": round(phase, 3),
-        "min_gap_s": min_gap, "pre_annotation": "tous « joueur » : corriger a la main",
+        "min_gap_s": min_gap,
+        "pre_annotation": ("detecteur CoachSight 3 classes : verifier et corriger a la main" if own_classes
+                           else "tous « joueur » : corriger a la main"),
         "items": items}))
     zf.close()
     data = buf.getvalue()
