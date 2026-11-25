@@ -20,6 +20,7 @@ from ultralytics import YOLO
 import pitch_fit
 import pitch_track
 import actors
+import calibcheck
 import coachteams
 import pitchmask
 import ball as ballmod   # 'ball' est deja une variable locale du suivi
@@ -112,6 +113,11 @@ STATIC_SPEED = float(os.environ.get("STATIC_SPEED", "0.25"))
 GRASS_FILTER = os.environ.get("GRASS_FILTER", "1") != "0"
 # Equipes a partir des couleurs de maillot saisies par le coach. 0 = desactive.
 COACH_COLOR_TEAMS = os.environ.get("COACH_COLOR_TEAMS", "1") != "0"
+# Calage qui saute d'une image a l'autre (camera qui suit le jeu) : image declaree
+# non calee quand la vitesse mediane des joueurs depasse CALIB_JUMP_MS (m/s).
+# CALIB_JUMP_CHECK=0 = desactive.
+CALIB_JUMP_CHECK = os.environ.get("CALIB_JUMP_CHECK", "1") != "0"
+CALIB_JUMP_MS = float(os.environ.get("CALIB_JUMP_MS", str(calibcheck.MAX_SPEED_MS)))
 
 
 def shirt_color(frame, box):
@@ -1483,6 +1489,18 @@ def process(inp):
         # marquee non calee, pour le site comme pour les mesures tactiques.
         ok = bool(cal) and positions_plausible([(p["x"], p["y"]) for p in out if not p["ball"]])
         frames.append({"t": tt, "points": out, "calibrated": ok, "view": view_of(i) if ok else None})
+    # Calage qui saute (camera qui suit le jeu) : l'image est marquee non calee,
+    # donc masquee sur le schema et ignoree des mesures tactiques. Jamais bloquant.
+    jump_hidden = 0
+    if CALIB_JUMP_CHECK and pitch_info:
+        try:
+            for i in calibcheck.jump_frames(frames, max_speed=CALIB_JUMP_MS):
+                frames[i]["calibrated"] = False
+                frames[i]["view"] = None
+                jump_hidden += 1
+        except Exception as e:
+            timings["calib_jump_error"] = scrub(e, 200)
+    timings["calib_jump_frames"] = jump_hidden
     # Couleur moyenne du maillot de chaque groupe (0 et 1), pour que
     # l'application relie chaque groupe a l'equipe du coach ou a l'adversaire.
     team_colors = []
@@ -1496,6 +1514,7 @@ def process(inp):
     if pitch_info:
         calibration.update(pitch_info)
         calibration["calibrated"] = calibration["calibrated"] or pitch_info["frames_calibrated"] > 0
+        calibration["jump_frames_hidden"] = jump_hidden
     elif camera_info.get("source") == "auto":
         calibration["method"] = "camera_tracking"
         calibration["error"] = camera_info.get("error", "camera position not found")
