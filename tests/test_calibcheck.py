@@ -66,3 +66,14 @@ def test_realistic_median_resists_a_few_fast_players():
 def test_empty_and_single():
     assert calibcheck.jump_frames([]) == set()
     assert calibcheck.jump_frames([_frame(0, _team())]) == set()
+
+
+def test_half_second_step_noise_is_not_flagged():
+    # a 2 images/s, 5 m de bruit en 0,5 s donneraient 10 m/s : l'ecart est plafonne a 1 s (5 m/s)
+    frames = [_frame(0.0, _team()), _frame(0.5, _team(dx=5.0)), _frame(1.0, _team(dx=5.5))]
+    assert calibcheck.jump_frames(frames) == set()
+
+
+def test_real_jump_still_flagged_at_half_second():
+    frames = [_frame(0.0, _team()), _frame(0.5, _team(dx=12.0))]
+    assert calibcheck.jump_frames(frames) == {1}

@@ -6,14 +6,15 @@ semblent alors se deplacer de plusieurs metres en une seconde. On compare
 chaque image calee a la derniere image gardee : si la vitesse mediane des
 joueurs suivis dans les deux images depasse `max_speed` (m/s), l'image est
 declaree douteuse. Un sprint de pointe fait environ 8 a 9 m/s et la mediane
-normale est autour de 2 m/s, donc une mediane au-dessus de 6 m/s ne peut venir
+normale est autour de 2 m/s, donc une mediane au-dessus de 8 m/s ne peut venir
 que d'un saut du calage.
 
 Fonction pure, sans numpy : elle ne depend que des images deja construites.
 """
 from statistics import median
 
-MAX_SPEED_MS = 6.0     # vitesse mediane maximale plausible, en m/s
+MAX_SPEED_MS = 8.0     # vitesse mediane maximale plausible, en m/s
+MIN_DT_S = 1.0         # ecart minimal retenu pour la vitesse : a 2 images/s le bruit de suivi serait double
 MIN_COMMON = 4         # joueurs suivis dans les deux images, au minimum
 MAX_GAP_S = 5.0        # au-dela, on ne compare plus : l'image est acceptee
 
@@ -48,7 +49,7 @@ def jump_frames(frames, max_speed=MAX_SPEED_MS, min_common=MIN_COMMON, max_gap_s
         if len(common) < min_common:
             ref_t, ref_pts = t, pts
             continue
-        speeds = [((pts[k][0] - ref_pts[k][0]) ** 2 + (pts[k][1] - ref_pts[k][1]) ** 2) ** 0.5 / dt
+        speeds = [((pts[k][0] - ref_pts[k][0]) ** 2 + (pts[k][1] - ref_pts[k][1]) ** 2) ** 0.5 / max(dt, MIN_DT_S)
                   for k in common]
         if median(speeds) > max_speed:
             flagged.add(i)
