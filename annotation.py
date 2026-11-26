@@ -108,7 +108,8 @@ def annotation_batch(inp, model, download, imgsz, play_windows, video_end, scrub
             if not ok:
                 continue
             h0, w0 = frame.shape[:2]
-            res = model(frame, classes=only_classes, conf=conf, imgsz=imgsz, verbose=False)[0]
+            # agnostic_nms : une personne = un seul cadre (sinon v2 dessine un cadre joueur ET un cadre gardien/arbitre)
+            res = model(frame, classes=only_classes, conf=conf, imgsz=imgsz, verbose=False, agnostic_nms=own_classes)[0]
             if w0 > max_w:
                 frame = cv2.resize(frame, (max_w, int(h0 * max_w / w0)), interpolation=cv2.INTER_AREA)
             h, w = frame.shape[:2]
